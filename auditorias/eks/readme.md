@@ -4,6 +4,23 @@ Crie um arquivo chamado `eks-inventory.sh` no CloudShell e cole isso:
 
 ## COMO USAR
 
+**0. (Opcional) Validar permissões antes de rodar:**
+
+Se quiser confirmar que tem acesso necessário para listar clusters EKS:
+
+```bash
+aws iam simulate-principal-policy \
+  --policy-source-arn $(aws sts get-caller-identity --query 'Arn' --output text) \
+  --action-names eks:DescribeClusters eks:ListClusters eks:ListNodegroups eks:ListAddons eks:DescribeAddon \
+  --resource-arns "*" \
+  --query 'EvaluationResults[*].[EvalActionName,EvalDecision]' \
+  --output table
+```
+
+Se todos retornarem `allowed`, você está pronto. Se algum retornar `implicitDeny`, avise que precisa de permissões adicionais.
+
+---
+
 **1. No CloudShell, copie e cole o script acima em um arquivo:**
 ```bash
 nano eks-inventory.sh
