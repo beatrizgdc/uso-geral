@@ -19,6 +19,14 @@ aws iam simulate-principal-policy \
 
 Se todos retornarem `allowed`, você está pronto. Se algum retornar `implicitDeny`, avise que precisa de permissões adicionais.
 
+Se der erro (tipo "role not found"), significa que o nome da role é diferente. Nesse caso, rode:
+
+```bash
+aws iam get-role --role-name beatriz-cevaio-darede --query 'Role.Arn' --output text
+```
+
+E use o ARN que retornar no comando acima.
+
 ---
 
 **1. No CloudShell, copie e cole o script acima em um arquivo:**
