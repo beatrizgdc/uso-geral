@@ -65,8 +65,6 @@
 | Sem eventos de erro no cluster  | [ ] | [ ]     | [ ]  | `kubectl get events --all-namespaces` |
 | Métricas de CPU/Memória normais | [ ] | [ ]     | [ ]  | CloudWatch Metrics                    |
 | Logs não têm erros críticos     | [ ] | [ ]     | [ ]  | CloudWatch Logs Insights              |
-| Aplicações respondendo          | [ ] | [ ]     | [ ]  | Smoke test customizado                |
-| Backup automático rodou         | [ ] | [ ]     | [ ]  | AWS Backup console                    |
 
 ---
 
