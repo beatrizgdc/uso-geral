@@ -96,9 +96,17 @@ def discover_generic_resources(
     region: str,
     services: list[Service],
     expected_tag_value: str,
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
+    """Devolve `(recursos, falhas)`. `falhas` é uma lista de dicts
+    `{"regiao", "etapa", "erro"}` no mesmo formato que `main.py` já grava em
+    `falhas_descoberta` — antes, uma falha aqui (ex.: `AccessDenied`,
+    throttling esgotado, erro no meio da paginação) só ia para o log; o
+    `try/except Exception` de `main.py` nunca via essas falhas porque eram
+    capturadas aqui dentro. Como a Etapa 4/dashboard só consome o JSON, não
+    o log da execução, isso escondia falhas reais em escala."""
     client = session.client("resourcegroupstaggingapi", region_name=region)
     results: list[dict] = []
+    falhas: list[dict] = []
     token = None
     pages = 0
     try:
@@ -117,19 +125,28 @@ def discover_generic_resources(
             token = resp.get("PaginationToken")
             if not token:
                 break
-    except ClientError:
+    except ClientError as exc:
         logger.exception(
             "Falha ao consultar Resource Groups Tagging API em %s (página %d) — "
             "prosseguindo com o que já foi coletado nesta região",
             region,
             pages,
         )
+        erro = exc.response.get("Error", {})
+        falhas.append(
+            {
+                "regiao": region,
+                "etapa": "generico",
+                "erro": f"get_resources (página {pages + 1}): {erro.get('Code', '')}: "
+                f"{erro.get('Message', str(exc))}",
+            }
+        )
     logger.info(
         "Região %s: %d recursos elegíveis encontrados via Resource Groups Tagging API",
         region,
         len(results),
     )
-    return results
+    return results, falhas
 
 
 # ---------------------------------------------------------------------------
@@ -155,12 +172,20 @@ def discover_bedrock_resources(
     region: str,
     services: list[Service],
     expected_tag_value: str,
-) -> list[dict]:
-    """Enumera Amazon Bedrock application inference profiles.
+) -> tuple[list[dict], list[dict]]:
+    """Enumera Amazon Bedrock application inference profiles. Devolve
+    `(recursos, falhas)` — ver docstring de `discover_generic_resources`.
 
     Profiles do tipo sistema (cross-region) não suportam tag e são ignorados
     por construção: `typeEquals=APPLICATION` já os exclui do list_inference_profiles.
-    """
+
+    Falha ao ler as tags de UM profile é tratada como `falha`, não só um
+    log: sem essa leitura o recurso entra no relatório com `tags={}` (ou
+    seja, "sem tag"), quando na verdade o estado real é desconhecido — a
+    Etapa 2a decidiria `taguear` em cima de uma suposição, não de um fato
+    confirmado (a revalidação da Etapa 2c ainda impede a escrita errada,
+    mas o relatório de compliance da Etapa 1 ficaria enganoso sem esta
+    falha registrada)."""
     bedrock_service = next(
         (s for s in services if s.product_service_code == "AmazonBedrock"), None
     )
@@ -168,6 +193,7 @@ def discover_bedrock_resources(
 
     client = session.client("bedrock", region_name=region)
     results: list[dict] = []
+    falhas: list[dict] = []
     next_token = None
     try:
         while True:
@@ -177,14 +203,23 @@ def discover_bedrock_resources(
                 try:
                     tags_resp = _list_tags_for_bedrock_resource(client, arn)
                     tags = tags_list_to_dict(tags_resp.get("tags", []))
-                except ClientError:
+                except ClientError as exc:
                     logger.exception(
                         "Falha ao obter tags do inference profile %s em %s — "
-                        "tratando como sem tags",
+                        "tratando como sem tags e registrando falha de descoberta",
                         arn,
                         region,
                     )
                     tags = {}
+                    erro = exc.response.get("Error", {})
+                    falhas.append(
+                        {
+                            "regiao": region,
+                            "etapa": "bedrock",
+                            "erro": f"list_tags_for_resource({arn}): {erro.get('Code', '')}: "
+                            f"{erro.get('Message', str(exc))}",
+                        }
+                    )
                 results.append(
                     _build_resource(
                         arn,
@@ -201,8 +236,21 @@ def discover_bedrock_resources(
     except ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code", "")
         if error_code in ("AccessDeniedException", "UnrecognizedClientException"):
+            # NÃO é tratado como benigno silenciosamente: `AccessDenied`
+            # tipicamente indica falta de permissão IAM, não "região sem
+            # Bedrock" — as duas coisas não dão pra distinguir com certeza
+            # só pelo código do erro (precisaria de confirmação em sandbox,
+            # ver melhorias-futuras.md). Uma versão anterior assumia que era
+            # sempre benigno e não registrava falha — testado e comprovado
+            # errado: uma role sem `bedrock:ListInferenceProfiles` produz
+            # exatamente esse erro em TODAS as regiões, e o relatório
+            # mostraria "0 profiles" com confiança total, escondendo um
+            # problema de permissão real na conta inteira. Por isso sempre
+            # vira falha agora, só com um nível de log mais baixo.
             logger.warning(
-                "Sem acesso ao Bedrock em %s (%s) — pulando região para este serviço",
+                "Falha ao listar Bedrock application inference profiles em %s (%s) — "
+                "pode ser região sem Bedrock ou falta de permissão IAM, não dá para "
+                "distinguir com certeza só pelo código de erro",
                 region,
                 error_code,
             )
@@ -210,12 +258,20 @@ def discover_bedrock_resources(
             logger.exception(
                 "Falha ao listar Bedrock application inference profiles em %s", region
             )
+        erro = exc.response.get("Error", {})
+        falhas.append(
+            {
+                "regiao": region,
+                "etapa": "bedrock",
+                "erro": f"list_inference_profiles: {erro.get('Code', '')}: {erro.get('Message', str(exc))}",
+            }
+        )
     logger.info(
         "Região %s: %d Bedrock application inference profiles encontrados",
         region,
         len(results),
     )
-    return results
+    return results, falhas
 
 
 # ---------------------------------------------------------------------------
@@ -256,16 +312,62 @@ def _describe_auto_scaling_group(client, asg_name: str) -> dict:
     return client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
 
 
-@with_backoff()
-def _describe_instances(client, filters: list[dict]) -> dict:
-    return client.describe_instances(Filters=filters)
+def _chunk(items: list, size: int) -> list[list]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+# Tamanho de lote conservador para os filtros "instance-id"/"attachment.instance-id"
+# abaixo — a AWS não documenta um limite fixo e único para o número de
+# valores num filtro de describe_instances/describe_volumes, então 100 é
+# uma escolha conservadora (bem abaixo de qualquer limite conhecido) em vez
+# de assumir que a lista de instance_ids de um cluster nunca vai ser grande
+# o suficiente para importar.
+_TAMANHO_LOTE_FILTRO_EC2 = 100
 
 
 @with_backoff()
-def _describe_volumes(client, instance_ids: list[str]) -> dict:
-    return client.describe_volumes(
-        Filters=[{"Name": "attachment.instance-id", "Values": instance_ids}]
-    )
+def _describe_instances_page(client, filters: list[dict], next_token: str | None) -> dict:
+    kwargs: dict = {"Filters": filters}
+    if next_token:
+        kwargs["NextToken"] = next_token
+    return client.describe_instances(**kwargs)
+
+
+def _describe_instances_all(client, filters: list[dict]) -> list[dict]:
+    """Pagina `describe_instances` inteiro — devolve todas as `Reservations`.
+
+    Sem isso, uma resposta paginada (conta/cluster com muitas instâncias)
+    perderia silenciosamente as instâncias das páginas seguintes."""
+    reservations: list[dict] = []
+    token = None
+    while True:
+        resp = _describe_instances_page(client, filters, token)
+        reservations.extend(resp.get("Reservations", []))
+        token = resp.get("NextToken")
+        if not token:
+            break
+    return reservations
+
+
+@with_backoff()
+def _describe_volumes_page(client, instance_ids: list[str], next_token: str | None) -> dict:
+    kwargs: dict = {"Filters": [{"Name": "attachment.instance-id", "Values": instance_ids}]}
+    if next_token:
+        kwargs["NextToken"] = next_token
+    return client.describe_volumes(**kwargs)
+
+
+def _describe_volumes_all(client, instance_ids: list[str]) -> list[dict]:
+    """Pagina `describe_volumes` inteiro — devolve todos os `Volumes`."""
+    volumes: list[dict] = []
+    token = None
+    while True:
+        resp = _describe_volumes_page(client, instance_ids, token)
+        volumes.extend(resp.get("Volumes", []))
+        token = resp.get("NextToken")
+        if not token:
+            break
+    return volumes
 
 
 @with_backoff()
@@ -336,7 +438,7 @@ def _get_node_instance_ids_by_cluster_tags(ec2_client, cluster_name: str) -> lis
     ]
     for filters in filter_sets:
         try:
-            resp = _describe_instances(ec2_client, filters)
+            reservations = _describe_instances_all(ec2_client, filters)
         except ClientError:
             logger.exception(
                 "Falha ao buscar instâncias EC2 do cluster EKS %s com filtro %s",
@@ -344,7 +446,7 @@ def _get_node_instance_ids_by_cluster_tags(ec2_client, cluster_name: str) -> lis
                 filters,
             )
             continue
-        for reservation in resp.get("Reservations", []):
+        for reservation in reservations:
             for instance in reservation.get("Instances", []):
                 instance_ids.add(instance["InstanceId"])
     return sorted(instance_ids)
@@ -353,52 +455,50 @@ def _get_node_instance_ids_by_cluster_tags(ec2_client, cluster_name: str) -> lis
 def _instances_arns_and_tags(
     ec2_client, account_id: str, region: str, instance_ids: list[str]
 ) -> list[tuple[str, dict]]:
-    if not instance_ids:
-        return []
-    out = []
-    try:
-        resp = _describe_instances(
-            ec2_client, [{"Name": "instance-id", "Values": instance_ids}]
-        )
-    except ClientError:
-        logger.exception("Falha ao obter tags das instâncias EKS %s", instance_ids)
-        return []
-    for reservation in resp.get("Reservations", []):
-        for instance in reservation.get("Instances", []):
-            arn = f"arn:aws:ec2:{region}:{account_id}:instance/{instance['InstanceId']}"
-            tags = tags_list_to_dict(instance.get("Tags", []))
-            out.append((arn, tags))
+    out: list[tuple[str, dict]] = []
+    for lote in _chunk(instance_ids, _TAMANHO_LOTE_FILTRO_EC2):
+        try:
+            reservations = _describe_instances_all(ec2_client, [{"Name": "instance-id", "Values": lote}])
+        except ClientError:
+            logger.exception("Falha ao obter tags das instâncias EKS %s", lote)
+            continue
+        for reservation in reservations:
+            for instance in reservation.get("Instances", []):
+                arn = f"arn:aws:ec2:{region}:{account_id}:instance/{instance['InstanceId']}"
+                tags = tags_list_to_dict(instance.get("Tags", []))
+                out.append((arn, tags))
     return out
 
 
 def _volumes_arns_and_tags(
     ec2_client, account_id: str, region: str, instance_ids: list[str]
 ) -> list[tuple[str, dict]]:
-    if not instance_ids:
-        return []
-    out = []
-    try:
-        resp = _describe_volumes(ec2_client, instance_ids)
-    except ClientError:
-        logger.exception("Falha ao obter volumes EBS dos nodes EKS %s", instance_ids)
-        return []
-    for volume in resp.get("Volumes", []):
-        arn = f"arn:aws:ec2:{region}:{account_id}:volume/{volume['VolumeId']}"
-        tags = tags_list_to_dict(volume.get("Tags", []))
-        out.append((arn, tags))
+    out: list[tuple[str, dict]] = []
+    for lote in _chunk(instance_ids, _TAMANHO_LOTE_FILTRO_EC2):
+        try:
+            volumes = _describe_volumes_all(ec2_client, lote)
+        except ClientError:
+            logger.exception("Falha ao obter volumes EBS dos nodes EKS %s", lote)
+            continue
+        for volume in volumes:
+            arn = f"arn:aws:ec2:{region}:{account_id}:volume/{volume['VolumeId']}"
+            tags = tags_list_to_dict(volume.get("Tags", []))
+            out.append((arn, tags))
     return out
 
 
-def _load_balancers_for_cluster(
-    elbv2_client, cluster_name: str
-) -> list[tuple[str, dict]]:
-    """Heurística best-effort: identifica load balancers do AWS Load Balancer
-    Controller pelas tags de convenção `elbv2.k8s.aws/cluster` (ALB via
-    Ingress) e `kubernetes.io/cluster/<nome>` (NLB via Service, e também usado
-    pelo controlador legado in-tree)."""
-    matched: list[tuple[str, dict]] = []
-    marker = None
+def _list_region_load_balancers_with_tags(elbv2_client) -> tuple[list[tuple[str, dict]], str | None]:
+    """Lista TODOS os load balancers da região com suas tags, uma vez só —
+    reaproveitado por `_filter_load_balancers_for_cluster` para cada
+    cluster, em vez de relistar a região inteira a cada cluster (uma conta
+    com N clusters EKS fazia N varreduras completas da região antes desta
+    correção).
+
+    Devolve `(resultado, falha_msg)` — `falha_msg` só é preenchido quando a
+    listagem falhou de forma a comprometer o resultado inteiro (não a falha
+    de um batch de tags isolado, tratada à parte abaixo)."""
     all_arns: list[str] = []
+    marker = None
     try:
         while True:
             resp = _describe_load_balancers_page(elbv2_client, marker)
@@ -406,25 +506,38 @@ def _load_balancers_for_cluster(
             marker = resp.get("NextMarker")
             if not marker:
                 break
-    except ClientError:
-        logger.exception("Falha ao listar load balancers para o cluster EKS %s", cluster_name)
-        return matched
+    except ClientError as exc:
+        logger.exception("Falha ao listar load balancers da região para descoberta EKS")
+        erro = exc.response.get("Error", {})
+        return [], f"describe_load_balancers: {erro.get('Code', '')}: {erro.get('Message', str(exc))}"
 
-    for i in range(0, len(all_arns), 20):  # describe_tags aceita até 20 ARNs por chamada
-        batch = all_arns[i : i + 20]
+    resultado: list[tuple[str, dict]] = []
+    for batch in [all_arns[i : i + 20] for i in range(0, len(all_arns), 20)]:  # describe_tags aceita até 20 ARNs
         try:
             resp = _describe_lb_tags(elbv2_client, batch)
         except ClientError:
             logger.exception("Falha ao obter tags de load balancers (batch %s)", batch)
             continue
         for desc in resp.get("TagDescriptions", []):
-            tags = tags_list_to_dict(desc.get("Tags", []))
-            is_cluster_lb = tags.get("elbv2.k8s.aws/cluster") == cluster_name or tags.get(
-                f"kubernetes.io/cluster/{cluster_name}"
-            ) in ("owned", "shared")
-            if is_cluster_lb:
-                matched.append((desc["ResourceArn"], tags))
-    return matched
+            resultado.append((desc["ResourceArn"], tags_list_to_dict(desc.get("Tags", []))))
+    return resultado, None
+
+
+def _filter_load_balancers_for_cluster(
+    region_load_balancers: list[tuple[str, dict]], cluster_name: str
+) -> list[tuple[str, dict]]:
+    """Heurística best-effort, sem nenhuma chamada de API (filtro puro sobre
+    o resultado já coletado por `_list_region_load_balancers_with_tags`):
+    identifica load balancers do AWS Load Balancer Controller pelas tags de
+    convenção `elbv2.k8s.aws/cluster` (ALB via Ingress) e
+    `kubernetes.io/cluster/<nome>` (NLB via Service, e também usado pelo
+    controlador legado in-tree)."""
+    return [
+        (arn, tags)
+        for arn, tags in region_load_balancers
+        if tags.get("elbv2.k8s.aws/cluster") == cluster_name
+        or tags.get(f"kubernetes.io/cluster/{cluster_name}") in ("owned", "shared")
+    ]
 
 
 def discover_eks_resources(
@@ -432,26 +545,62 @@ def discover_eks_resources(
     region: str,
     account_id: str,
     expected_tag_value: str,
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
+    """Devolve `(recursos, falhas)` — ver docstring de
+    `discover_generic_resources`. Cobre os pontos de falha "largos" (região
+    inteira, cluster inteiro, node group inteiro); as falhas mais granulares
+    dentro de um cluster (ASG isolado, um chunk de instâncias/volumes EC2)
+    continuam só logadas — o mesmo EC2/EBS ainda aparece no relatório via
+    `discover_generic_resources` mesmo se o enriquecimento específico de EKS
+    falhar aqui, então o recurso em si não fica invisível, só perde o
+    `tipo_recurso` mais específico."""
     eks_client = session.client("eks", region_name=region)
     ec2_client = session.client("ec2", region_name=region)
     autoscaling_client = session.client("autoscaling", region_name=region)
     elbv2_client = session.client("elbv2", region_name=region)
 
     results: list[dict] = []
+    falhas: list[dict] = []
     servico_nome = "Amazon EKS"
 
     try:
         cluster_names = _list_clusters(eks_client)
-    except ClientError:
+    except ClientError as exc:
         logger.exception("Falha ao listar clusters EKS em %s", region)
-        return results
+        erro = exc.response.get("Error", {})
+        falhas.append(
+            {
+                "regiao": region,
+                "etapa": "eks",
+                "erro": f"list_clusters: {erro.get('Code', '')}: {erro.get('Message', str(exc))}",
+            }
+        )
+        return results, falhas
+
+    # Uma varredura só de load balancers da região para todos os clusters
+    # (ver docstring de `_list_region_load_balancers_with_tags`) — só roda
+    # se houver pelo menos um cluster, para não pagar o custo em contas sem
+    # EKS.
+    region_load_balancers: list[tuple[str, dict]] = []
+    if cluster_names:
+        region_load_balancers, falha_lb = _list_region_load_balancers_with_tags(elbv2_client)
+        if falha_lb is not None:
+            falhas.append({"regiao": region, "etapa": "eks", "erro": falha_lb})
 
     for cluster_name in cluster_names:
         try:
             cluster = _describe_cluster(eks_client, cluster_name)
-        except ClientError:
+        except ClientError as exc:
             logger.exception("Falha ao descrever cluster EKS %s em %s", cluster_name, region)
+            erro = exc.response.get("Error", {})
+            falhas.append(
+                {
+                    "regiao": region,
+                    "etapa": "eks",
+                    "erro": f"describe_cluster({cluster_name}): {erro.get('Code', '')}: "
+                    f"{erro.get('Message', str(exc))}",
+                }
+            )
             continue
 
         results.append(
@@ -468,16 +617,34 @@ def discover_eks_resources(
         node_instance_ids: set[str] = set()
         try:
             nodegroup_names = _list_nodegroups(eks_client, cluster_name)
-        except ClientError:
+        except ClientError as exc:
             logger.exception("Falha ao listar node groups do cluster %s", cluster_name)
+            erro = exc.response.get("Error", {})
+            falhas.append(
+                {
+                    "regiao": region,
+                    "etapa": "eks",
+                    "erro": f"list_nodegroups({cluster_name}): {erro.get('Code', '')}: "
+                    f"{erro.get('Message', str(exc))}",
+                }
+            )
             nodegroup_names = []
 
         for ng_name in nodegroup_names:
             try:
                 nodegroup = _describe_nodegroup(eks_client, cluster_name, ng_name)
-            except ClientError:
+            except ClientError as exc:
                 logger.exception(
                     "Falha ao descrever node group %s do cluster %s", ng_name, cluster_name
+                )
+                erro = exc.response.get("Error", {})
+                falhas.append(
+                    {
+                        "regiao": region,
+                        "etapa": "eks",
+                        "erro": f"describe_nodegroup({cluster_name}/{ng_name}): {erro.get('Code', '')}: "
+                        f"{erro.get('Message', str(exc))}",
+                    }
                 )
                 continue
             results.append(
@@ -521,7 +688,7 @@ def discover_eks_resources(
                 )
             )
 
-        for arn, tags in _load_balancers_for_cluster(elbv2_client, cluster_name):
+        for arn, tags in _filter_load_balancers_for_cluster(region_load_balancers, cluster_name):
             results.append(
                 _build_resource(
                     arn,
@@ -539,4 +706,4 @@ def discover_eks_resources(
         len(results),
         len(cluster_names),
     )
-    return results
+    return results, falhas

@@ -10,11 +10,18 @@ disco é responsabilidade do chamador (o mesmo padrão que `report.py` já usa:
 Cada recurso do relatório da Etapa 1 é classificado em exatamente uma
 categoria:
 
-- `taguear`   — tag ausente e recurso não gerenciado por IaC. Candidato a
-  tagueamento via API nas Etapas 2b/2c.
+- `taguear`   — tag ausente, recurso não gerenciado por IaC, e nenhuma tag
+  de grafia parecida encontrada. Candidato a tagueamento via API nas
+  Etapas 2b/2c.
 - `pular_iac` — recurso gerenciado por IaC (heurística da Etapa 1),
   independente de ter ou não a tag hoje. Nunca tagueado via API/CLI/Console
   — só identificado e sinalizado para tagueamento pelo próprio IaC.
+- `revisar_tag_similar` — tag `aws-apn-id` ausente, mas encontrada uma tag
+  com grafia parecida (ex.: `AWS-APN-ID`, case diferente —
+  `tag_status.find_similar_tag_keys`), quase certamente um erro de
+  digitação humano. Nunca tagueado via API automaticamente: aplicar
+  `aws-apn-id` por cima criaria uma segunda chave quase-duplicada em vez de
+  corrigir o erro original — precisa de revisão humana antes.
 - `ja_ok`     — tag já presente com o valor esperado (comparação exata,
   case-sensitive, herdada de `tag_status.get_tag_status`). Nada a fazer.
 - `conflito`  — tag presente com um valor diferente do esperado. Nunca
@@ -25,11 +32,17 @@ Precedência (aplicada nesta ordem):
 
 1. Tag ausente:
    a. IaC detectado (`cloudformation` ou `terraform_heuristico`) -> `pular_iac`.
-   b. Caso contrário (incluindo `iac.tipo == "desconhecido"`) -> `taguear`.
+      Tem precedência sobre o item seguinte: se o recurso já não seria
+      tagueado via API de qualquer forma, o risco de criar uma chave
+      quase-duplicada não existe — o alerta de tag similar continua visível
+      no relatório, só não muda a decisão.
+   b. Tag de grafia parecida encontrada -> `revisar_tag_similar`.
+   c. Caso contrário (incluindo `iac.tipo == "desconhecido"`) -> `taguear`.
 2. Tag presente:
    a. Valor bate com o esperado -> `ja_ok`.
    b. Valor diferente -> `conflito` (aqui o IaC é só metadado informativo no
-      relatório — nunca muda a decisão).
+      relatório — nunca muda a decisão; tag similar também não se aplica,
+      já existe uma `aws-apn-id` de fato).
 
 **Importante:** "tag ausente"/"valor bate com o esperado" acima NÃO são lidos
 do `status_tag` já calculado pela Etapa 1 — são recalculados aqui via
@@ -77,10 +90,17 @@ from .tag_status import TAG_KEY, STATUS_CONFLITO, STATUS_OK, STATUS_SEM_TAG, get
 
 DECISAO_TAGUEAR = "taguear"
 DECISAO_PULAR_IAC = "pular_iac"
+DECISAO_REVISAR_TAG_SIMILAR = "revisar_tag_similar"
 DECISAO_JA_OK = "ja_ok"
 DECISAO_CONFLITO = "conflito"
 
-_TODAS_AS_DECISOES = (DECISAO_TAGUEAR, DECISAO_PULAR_IAC, DECISAO_JA_OK, DECISAO_CONFLITO)
+_TODAS_AS_DECISOES = (
+    DECISAO_TAGUEAR,
+    DECISAO_PULAR_IAC,
+    DECISAO_REVISAR_TAG_SIMILAR,
+    DECISAO_JA_OK,
+    DECISAO_CONFLITO,
+)
 _TODOS_OS_STATUS_IAC = (IAC_CLOUDFORMATION, IAC_TERRAFORM_HEURISTICO, IAC_DESCONHECIDO)
 _IAC_DETECTADO = (IAC_CLOUDFORMATION, IAC_TERRAFORM_HEURISTICO)
 
@@ -129,23 +149,55 @@ def _validar_recurso(resource: Any) -> str | None:
     return None
 
 
-def _decidir(valor_tag_atual: str | None, expected_tag_value: str, iac_tipo: str) -> tuple[str, str]:
+def _decidir(
+    valor_tag_atual: str | None,
+    expected_tag_value: str,
+    iac_tipo: str,
+    tag_similar_encontrada: bool,
+    ferramenta_aws: str | None = None,
+) -> tuple[str, str]:
     """Aplica a regra de precedência (ver docstring do módulo) e devolve
     `(decisao, motivo)`.
 
     Recalcula o status da tag via `tag_status.get_tag_status` a partir do
     valor bruto já extraído pela Etapa 1 (`valor_tag_atual`), reconstruindo
     um dict de uma chave só — em vez de confiar no `status_tag` já congelado
-    do relatório da Etapa 1 (ver docstring do módulo para o porquê)."""
+    do relatório da Etapa 1 (ver docstring do módulo para o porquê).
+
+    `ferramenta_aws` (de `iac_detection.detect_iac`, via
+    `resource["iac"]["gerenciado_por_ferramenta_aws"]`): quando a stack de
+    CloudFormation detectada é gerada internamente por uma automação da AWS
+    (Elastic Beanstalk, Control Tower, Service Catalog) ou por `eksctl`, não
+    pelo cliente diretamente, o `motivo` de `pular_iac` aponta a ação real
+    (configurar a tag na própria ferramenta) em vez do texto genérico
+    "taguear via IaC" — que não tem nenhuma ação por trás nesses casos,
+    porque não existe template do cliente para editar. **A decisão
+    continua `pular_iac`, nunca tagueada via API** — isso nunca muda."""
     tags_reconstruidas = {} if valor_tag_atual is None else {TAG_KEY: valor_tag_atual}
     status_tag, _ = get_tag_status(tags_reconstruidas, expected_tag_value)
 
     if status_tag == STATUS_SEM_TAG:
         if iac_tipo in _IAC_DETECTADO:
+            if ferramenta_aws:
+                return (
+                    DECISAO_PULAR_IAC,
+                    f"tag aws-apn-id ausente; recurso gerenciado internamente por "
+                    f"{ferramenta_aws} via CloudFormation — não existe IaC do cliente "
+                    f"para editar aqui; configure a tag diretamente nas opções/config do "
+                    f"{ferramenta_aws}, nunca via API/CLI/Console",
+                )
             return (
                 DECISAO_PULAR_IAC,
                 f"tag aws-apn-id ausente; recurso gerenciado por IaC ({iac_tipo}) "
                 "— taguear via IaC, não via API/CLI/Console",
+            )
+        if tag_similar_encontrada:
+            return (
+                DECISAO_REVISAR_TAG_SIMILAR,
+                "tag aws-apn-id ausente, mas encontrada uma tag de grafia parecida "
+                "(case diferente) — provável erro de digitação; precisa de revisão "
+                "humana antes de taguear via API, para não criar uma chave "
+                "quase-duplicada por engano",
             )
         return (
             DECISAO_TAGUEAR,
@@ -191,7 +243,11 @@ def classify_resource(resource: Any, expected_tag_value: str) -> dict | None:
 
     iac = resource["iac"]
     valor_tag_atual = resource.get("valor_tag_encontrado")
-    decisao, motivo = _decidir(valor_tag_atual, expected_tag_value, iac["tipo"])
+    tag_similar_encontrada = bool(resource.get("tag_similar_encontrada", False))
+    ferramenta_aws = iac.get("gerenciado_por_ferramenta_aws")
+    decisao, motivo = _decidir(
+        valor_tag_atual, expected_tag_value, iac["tipo"], tag_similar_encontrada, ferramenta_aws
+    )
 
     return {
         "arn": resource["arn"],
@@ -201,12 +257,13 @@ def classify_resource(resource: Any, expected_tag_value: str) -> dict | None:
         "valor_tag_atual": valor_tag_atual,
         "decisao": decisao,
         "motivo": motivo,
-        "tag_similar_encontrada": bool(resource.get("tag_similar_encontrada", False)),
+        "tag_similar_encontrada": tag_similar_encontrada,
         "tag_similar_chaves": list(resource.get("tag_similar_chaves", [])),
         "iac": {
             "tipo": iac["tipo"],
             "detectado": iac["tipo"] in _IAC_DETECTADO,
             "stack_name": iac.get("stack_name"),
+            "gerenciado_por_ferramenta_aws": ferramenta_aws,
         },
     }
 
@@ -216,9 +273,16 @@ def build_decision_report(etapa1_report: dict, expected_tag_value: str) -> dict:
     carregado da Etapa 1 (`report.build_report`). Função pura — mesmo input
     sempre produz o mesmo output, sem I/O.
 
-    Este é o contrato de entrada da Etapa 2b (execução em dry-run): o
+    Este é o contrato de entrada das Etapas 2b/2c (`tag_execution.py`): o
     formato de `recursos` aqui deve ser suficiente para uma etapa seguinte
     decidir o que chamar na API, sem precisar voltar ao relatório da Etapa 1.
+
+    `descoberta_executada_em` propaga `etapa1_report["executado_em"]` (quando
+    a descoberta rodou, não quando esta decisão foi tomada) — é o que
+    `tag_execution.run_tagging_execution` usa para recusar agir sobre uma
+    descoberta velha demais (`max_decision_age_hours`), já que o próprio
+    `executado_em` desta função sempre reflete "agora", mesmo que a
+    descoberta subjacente tenha dias.
     """
     resources = etapa1_report.get("recursos") or []
 
@@ -242,6 +306,7 @@ def build_decision_report(etapa1_report: dict, expected_tag_value: str) -> dict:
     return {
         "conta_id": etapa1_report.get("conta_id"),
         "executado_em": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "descoberta_executada_em": etapa1_report.get("executado_em"),
         "valor_tag_esperado": expected_tag_value,
         "resumo": {
             "total_recursos_avaliados": len(decisoes),

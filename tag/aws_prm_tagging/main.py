@@ -6,10 +6,10 @@ Três subcomandos, um por estágio implementado até agora:
 - `decide` — Etapa 2a: classifica o relatório da Etapa 1 em
   `taguear`/`pular_iac`/`ja_ok`/`conflito`. Também somente-leitura (função
   pura, sem chamada de API nenhuma).
-- `apply`  — Etapa 2b: simula (dry-run) o tagueamento dos recursos
-  `taguear` do relatório da Etapa 2a. Só faz chamadas de LEITURA na conta
-  (revalidação do estado atual da tag, salvo com `--no-revalidate`) — nunca
-  escreve. A execução real (Etapa 2c) ainda não existe; ver
+- `apply`  — Etapas 2b (default, dry-run) e 2c (`--live`, escrita real) do
+  tagueamento dos recursos `taguear` do relatório da Etapa 2a. Em dry-run,
+  só faz chamadas de LEITURA na conta (revalidação do estado atual de cada
+  recurso, salvo com `--no-revalidate`) — nunca escreve. Ver
   `docs/arquitetura.md#tag_executionpy`.
 
 Cada subcomando lê a saída em disco do estágio anterior e escreve a sua
@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 
 import boto3
@@ -31,6 +32,11 @@ from .retry import with_backoff
 
 logger = logging.getLogger("aws_prm_tagging")
 
+# Formato já confirmado e fechado para este projeto: "pc:<product-code>",
+# só letras/números depois do prefixo. Não é um formato genérico de tag da
+# AWS — é a decisão de escopo específica deste projeto (nunca "ra-...").
+_EXPECTED_TAG_VALUE_PATTERN = re.compile(r"^pc:[A-Za-z0-9]+$")
+
 
 @with_backoff()
 def _get_account_id(session: boto3.Session) -> str:
@@ -38,14 +44,19 @@ def _get_account_id(session: boto3.Session) -> str:
     return sts.get_caller_identity()["Account"]
 
 
-def _validate_expected_tag_value(value: str) -> None:
-    if not value.startswith("pc:"):
-        logger.warning(
-            "--expected-tag-value '%s' não começa com 'pc:' (formato padrão para "
-            "product code). Se for um Revenue Attribution ID, o formato esperado "
-            "é 'ra-<13 caracteres>' — confirme com o guia antes de prosseguir.",
+def _validate_expected_tag_value(value: str) -> bool:
+    """Erro de verdade (não só aviso) — o formato já está fechado para este
+    projeto, então um valor fora do padrão quase certamente é engano de
+    quem digitou o comando, não uma variação válida a aceitar."""
+    if not _EXPECTED_TAG_VALUE_PATTERN.match(value):
+        logger.error(
+            "--expected-tag-value '%s' inválido — o formato deste projeto é "
+            "'pc:<product-code>' (ex.: pc:5ugbbrmu7ud3u5hsipfzug61p), só "
+            "letras/números depois de 'pc:'.",
             value,
         )
+        return False
+    return True
 
 
 def _load_json(path: str) -> dict:
@@ -64,7 +75,8 @@ def _write_json(path: str, data: dict) -> None:
 
 
 def _run_map(args: argparse.Namespace) -> int:
-    _validate_expected_tag_value(args.expected_tag_value)
+    if not _validate_expected_tag_value(args.expected_tag_value):
+        return 1
 
     session = boto3.Session(profile_name=args.profile)
 
@@ -89,48 +101,56 @@ def _run_map(args: argparse.Namespace) -> int:
     logger.info("%d serviços elegíveis carregados do CSV oficial", len(service_list))
 
     all_resources: list[dict] = []
+    falhas_descoberta: list[dict] = []
     total_regions = len(active_regions)
     for idx, region in enumerate(active_regions, start=1):
         logger.info("Processando região %s (%d/%d)", region, idx, total_regions)
 
         try:
-            all_resources.extend(
-                resource_discovery.discover_generic_resources(
-                    session, region, service_list, args.expected_tag_value
-                )
+            recursos, falhas = resource_discovery.discover_generic_resources(
+                session, region, service_list, args.expected_tag_value
             )
-        except Exception:
+            all_resources.extend(recursos)
+            falhas_descoberta.extend(falhas)
+        except Exception as exc:
+            # Backstop para falha inesperada (bug de programação) — as
+            # falhas de API já esperadas (ClientError) são capturadas
+            # dentro de resource_discovery.py e voltam na lista `falhas`
+            # acima, não chegam a levantar exceção até aqui.
             logger.exception(
                 "Falha inesperada na descoberta genérica em %s — pulando esta etapa "
                 "nesta região e continuando",
                 region,
             )
+            falhas_descoberta.append({"regiao": region, "etapa": "generico", "erro": str(exc)})
 
         try:
-            all_resources.extend(
-                resource_discovery.discover_bedrock_resources(
-                    session, region, service_list, args.expected_tag_value
-                )
+            recursos, falhas = resource_discovery.discover_bedrock_resources(
+                session, region, service_list, args.expected_tag_value
             )
-        except Exception:
+            all_resources.extend(recursos)
+            falhas_descoberta.extend(falhas)
+        except Exception as exc:
             logger.exception(
                 "Falha inesperada na descoberta de Bedrock em %s — pulando esta etapa "
                 "nesta região e continuando",
                 region,
             )
+            falhas_descoberta.append({"regiao": region, "etapa": "bedrock", "erro": str(exc)})
 
         try:
-            all_resources.extend(
-                resource_discovery.discover_eks_resources(
-                    session, region, account_id, args.expected_tag_value
-                )
+            recursos, falhas = resource_discovery.discover_eks_resources(
+                session, region, account_id, args.expected_tag_value
             )
-        except Exception:
+            all_resources.extend(recursos)
+            falhas_descoberta.extend(falhas)
+        except Exception as exc:
             logger.exception(
                 "Falha inesperada na descoberta de EKS em %s — pulando esta etapa "
                 "nesta região e continuando",
                 region,
             )
+            falhas_descoberta.append({"regiao": region, "etapa": "eks", "erro": str(exc)})
 
         logger.info(
             "Região %s concluída. Total acumulado de recursos: %d", region, len(all_resources)
@@ -151,9 +171,17 @@ def _run_map(args: argparse.Namespace) -> int:
         expected_tag_value=args.expected_tag_value,
         resources=deduped_resources,
         ou_tree=tree,
+        falhas_descoberta=falhas_descoberta,
     )
 
     _write_json(args.output, final_report)
+
+    if falhas_descoberta:
+        logger.warning(
+            "%d falha(s) de descoberta registrada(s) no relatório (falhas_descoberta) — "
+            "o total de recursos abaixo pode estar incompleto para as regiões/etapas afetadas.",
+            len(falhas_descoberta),
+        )
 
     logger.info(
         "Concluído. %d recursos mapeados em %d regiões. Relatório salvo em %s",
@@ -170,7 +198,8 @@ def _run_map(args: argparse.Namespace) -> int:
 
 
 def _run_decide(args: argparse.Namespace) -> int:
-    _validate_expected_tag_value(args.expected_tag_value)
+    if not _validate_expected_tag_value(args.expected_tag_value):
+        return 1
 
     try:
         etapa1_report = _load_json(args.input)
@@ -195,15 +224,16 @@ def _run_decide(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# apply — Etapa 2b (dry-run)
+# apply — Etapa 2b (dry-run, default) e Etapa 2c (--live)
 # ---------------------------------------------------------------------------
 
 
 def _run_apply(args: argparse.Namespace) -> int:
-    if args.live:
+    if args.live and args.no_revalidate:
         logger.error(
-            "Execução real (Etapa 2c) ainda não foi implementada — esta versão do "
-            "CLI só suporta o modo dry-run da Etapa 2b. Remova --live."
+            "--live não pode ser combinado com --no-revalidate: executar de verdade "
+            "sem revalidar o estado atual de cada recurso arrisca sobrescrever um "
+            "conflito que tenha aparecido depois da Etapa 2a. Rode sem --no-revalidate."
         )
         return 1
 
@@ -224,20 +254,27 @@ def _run_apply(args: argparse.Namespace) -> int:
 
     session = boto3.Session(profile_name=args.profile)
 
-    stage2b_report = tag_execution.run_stage2b(
-        decision_report,
-        session=session,
-        expected_tag_value=expected_tag_value,
-        revalidate=not args.no_revalidate,
-    )
-    _write_json(args.output, stage2b_report)
+    try:
+        execution_report = tag_execution.run_tagging_execution(
+            decision_report,
+            session=session,
+            expected_tag_value=expected_tag_value,
+            dry_run=not args.live,
+            revalidate=not args.no_revalidate,
+            max_decision_age_hours=args.max_decision_age_hours,
+        )
+    except (tag_execution.DecisionReportDesatualizadoError, tag_execution.RevalidacaoObrigatoriaError) as exc:
+        logger.error("%s", exc)
+        return 1
 
-    resumo = stage2b_report["resumo"]
+    _write_json(args.output, execution_report)
+
+    resumo = execution_report["resumo"]
     logger.info(
-        "Concluído (dry-run). %d recurso(s) processado(s). Por resultado: %s. "
-        "Relatório salvo em %s",
-        resumo["total_recursos_processados"],
-        resumo["por_resultado"],
+        "Concluído (%s). %d recurso(s) no relatório. Por categoria: %s. Relatório salvo em %s",
+        execution_report["modo"],
+        resumo["total_recursos"],
+        resumo["por_categoria_final"],
         args.output,
     )
     return 0
@@ -281,7 +318,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
     apply_parser = subparsers.add_parser(
         "apply",
-        help="Etapa 2b: simula (dry-run) o tagueamento do relatório da Etapa 2a. Nunca escreve na conta.",
+        help="Etapa 2b (dry-run, default) ou 2c (--live) do tagueamento do relatório da Etapa 2a.",
     )
     apply_parser.add_argument("--input", required=True, help="Relatório JSON da Etapa 2a (saída de 'decide')")
     apply_parser.add_argument("--profile", default=None, help="Perfil de credenciais AWS local")
@@ -289,13 +326,21 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     apply_parser.add_argument(
         "--no-revalidate",
         action="store_true",
-        help="Desliga a revalidação do estado atual da tag antes de simular cada recurso "
+        help="Desliga a revalidação do estado atual de cada recurso antes de agir sobre ele "
         "(por padrão, revalida — ver docs/arquitetura.md#tag_executionpy)",
     )
     apply_parser.add_argument(
         "--live",
         action="store_true",
-        help="Execução real em vez de dry-run — Etapa 2c, ainda não implementada.",
+        help="Execução real (Etapa 2c) — escreve a tag de verdade na conta. Por padrão roda em "
+        "dry-run (Etapa 2b), sem escrever nada.",
+    )
+    apply_parser.add_argument(
+        "--max-decision-age-hours",
+        type=float,
+        default=None,
+        help="Recusa agir se a descoberta (Etapa 1) que embasa o relatório de decisão for mais "
+        "velha que este limite, em horas (default: sem checagem)",
     )
     apply_parser.set_defaults(func=_run_apply)
 

@@ -2,16 +2,30 @@
 
 ## Visão geral do fluxo
 
-`main.py` orquestra, nesta ordem:
+`main.py` tem 3 subcomandos hoje (`map`/`decide`/`apply` — ver seção
+`main.py` abaixo); esta visão geral é do subcomando `map` (Etapa 1), o mais
+envolvido dos três. `decide` (Etapa 2a) e `apply` (Etapas 2b/2c) são bem
+mais diretos — um lê a saída do anterior, chama a função de núcleo
+correspondente (`decision.build_decision_report`/
+`tag_execution.run_tagging_execution`) e grava o resultado; detalhes nas
+seções `decision.py`/`tag_execution.py` abaixo.
+
+`map` orquestra, nesta ordem:
 
 1. Resolve a sessão boto3 (`--profile` ou cadeia padrão de credenciais).
 2. `sts.get_caller_identity` para obter o `conta_id`.
 3. `regions.get_active_regions` para listar regiões comerciais ativas.
 4. `services.load_services` para carregar a lista oficial de serviços do CSV.
 5. Para cada região: `resource_discovery.discover_generic_resources`,
-   `discover_bedrock_resources` e `discover_eks_resources`, cada chamada
-   isolada em `try/except` — uma falha em uma etapa/região não aborta o
-   restante da execução.
+   `discover_bedrock_resources` e `discover_eks_resources`. Cada uma devolve
+   `(recursos, falhas)` — uma falha de API (`ClientError`, ex.: `AccessDenied`,
+   throttling esgotado, falha no meio da paginação) é capturada DENTRO da
+   função e volta na segunda posição da tupla, sem abortar o restante da
+   descoberta nem daquela etapa/região nem das seguintes; `main.py` só
+   estende `falhas_descoberta` com o que recebe. O `try/except Exception`
+   que também existe em `main.py` ao redor de cada chamada é só um backstop
+   para bug de programação genuíno — a falha de API esperada nunca chega a
+   levantar exceção até ali.
 6. `ou_tree.discover_ou_tree` (uma vez, não por região).
 7. `report.build_report` monta o JSON final e `main.py` grava em disco.
 
@@ -35,11 +49,12 @@ subcomandos, um por estágio implementado (`map`, `decide`, `apply` — ver
 daquele estágio (CLI args + leitura/escrita de arquivo). Quando as Etapas
 3-4 ganharem seus próprios entrypoints (handlers Lambda, ver
 [arquitetura-multicliente.md](arquitetura-multicliente.md)), eles seguem o
-mesmo padrão: importam os módulos do núcleo em vez de duplicar lógica. Só
-`apply` (Etapa 2b) faz alguma chamada de API na conta do cliente além de
-leitura pura — e mesmo assim só chamadas de **leitura** (revalidação); a
-Etapa 2b em si nunca escreve (ver `tag_execution.py` abaixo). A primeira
-escrita de fato só existe na Etapa 2c, ainda não implementada.
+mesmo padrão: importam os módulos do núcleo em vez de duplicar lógica.
+`apply` cobre tanto a Etapa 2b (`--live` omitido, default — só leitura na
+conta, para revalidação) quanto a Etapa 2c (`--live` — primeira escrita de
+fato em toda a automação); é a mesma função (`tag_execution.run_tagging_execution`)
+nos dois casos, só trocando qual `Executor` está por baixo (ver
+`tag_execution.py` abaixo).
 
 ## Módulos
 
@@ -56,21 +71,34 @@ correspondente do CSV via a tabela interna `_NAMESPACE_TO_CODE`. Essa tabela é
 construída a partir de convenções documentadas de nomenclatura de ARN da AWS,
 não do CSV (o CSV não traz essa correspondência).
 
-Duas ambiguidades conhecidas, documentadas em comentários no próprio arquivo:
+Três ambiguidades/restrições de escopo conhecidas, documentadas em
+comentários no próprio arquivo:
 
+- **`ssm`** — o CSV traz a nota "OpsCenter only" para "AWS Systems
+  Manager", mas o namespace `ssm` nos ARNs cobre muito mais que isso
+  (parameters, documents, maintenance windows, associations...).
+  `classify_arn` restringe pelo tipo de recurso do ARN (mesmo padrão do
+  `ec2` abaixo): só `opsitem` é classificado como Systems Manager; qualquer
+  outro tipo sob `ssm` devolve `None` e fica fora da descoberta.
 - **`ec2`** é usado tanto por Amazon EC2 quanto pelos recursos de rede
-  faturados sob "AWS Transit Gateway"/"Amazon VPC Lattice" (mesmo código de
-  produto `AmazonVPC` no CSV, para duas linhas diferentes). Desambiguado por
-  tipo de recurso dentro do ARN (`instance`, `volume`, `security-group` etc.
-  vão para EC2; `vpc`, `transit-gateway`, `vpc-peering-connection` etc. vão
-  para a linha de rede).
+  faturados sob a linha "AWS Transit Gateway" do CSV (mesmo código de
+  produto `AmazonVPC`). Desambiguado por tipo de recurso dentro do ARN
+  (`instance`, `volume`, `security-group` etc. vão para EC2; `vpc`,
+  `transit-gateway`, `vpc-peering-connection` etc. vão para a linha de
+  rede). O namespace `vpc-lattice` também usa o código `AmazonVPC`, mas
+  **não** é ambíguo (identifica o recurso sem dúvida) — por isso é tratado
+  à parte, por nome (`_service_by_name`), em vez de cair na mesma busca por
+  código que pegaria sempre a primeira linha ("AWS Transit Gateway") e
+  rotularia todo recurso VPC Lattice errado no relatório (correção
+  aplicada; a tag em si nunca esteve errada, só o rótulo `servico`).
 - **`rds`** é compartilhado por Amazon RDS, Aurora, Amazon DocumentDB e Amazon
   Neptune (todos usam ARNs `arn:aws:rds:...`). Sem uma chamada adicional à API
   de cada engine para inspecionar o atributo `Engine`, não há como
   diferenciar com certeza pelo ARN — todos caem no bucket "Amazon Relational
   Database Service (RDS)". Isso é um ponto de refinamento futuro, não um bug:
   o recurso ainda é descoberto e classificado corretamente quanto ao status
-  da tag, só o rótulo de serviço no relatório pode não distinguir a engine.
+  da tag, só o rótulo de serviço no relatório pode não distinguir a engine
+  (registrado em [melhorias-futuras.md](melhorias-futuras.md#amazon-documentdb-e-amazon-neptune-aparecem-como-amazon-rds-no-relatório)).
 
 `Amazon Bedrock` (plano, não AgentCore) e `Amazon EKS` são deliberadamente
 **omitidos** dessa tabela: são tratados por lógica dedicada em
@@ -86,7 +114,13 @@ comerciais.
 
 ### `resource_discovery.py`
 
-Três funções públicas, cada uma isolada e reutilizável nos próximos estágios:
+Três funções públicas, cada uma isolada e reutilizável nos próximos
+estágios. Todas devolvem `(recursos, falhas)` — `falhas` é uma lista de
+dicts `{"regiao", "etapa", "erro"}` no mesmo formato que `main.py` grava em
+`falhas_descoberta` (ver `report.py` abaixo): uma `ClientError` capturada
+durante a descoberta (ex.: `AccessDenied`, throttling esgotado, falha no
+meio da paginação) volta como um item de `falhas`, não só um log — antes
+essas falhas eram só logadas aqui dentro e nunca chegavam ao JSON de saída.
 
 - **`discover_generic_resources`** — pagina `resourcegroupstaggingapi:GetResources`
   sem filtro de tipo (para não depender de uma lista de filtros mantida à
@@ -106,7 +140,9 @@ Três funções públicas, cada uma isolada e reutilizável nos próximos estág
   > na conta — criar esse índice é uma escrita, o que quebraria a premissa
   > de "100% somente-leitura" da Etapa 1 se feito por este script. Decisão
   > tomada: por ora, essa lacuna fica documentada como limitação conhecida
-  > em vez de resolvida — não pega recursos que nunca foram tagueados nenhuma
+  > em vez de resolvida (registrada em
+  > [melhorias-futuras.md](melhorias-futuras.md#cobertura-de-recursos-que-nunca-tiveram-tag-nenhuma))
+  > — não pega recursos que nunca foram tagueados nenhuma
   > vez. Isso não foi pego pelo teste em LocalStack porque a emulação de lá
   > não impõe essa mesma restrição (ver
   > [test/localstack/README.md](../test/localstack/README.md)).
@@ -115,7 +151,21 @@ Três funções públicas, cada uma isolada e reutilizável nos próximos estág
   `typeEquals=APPLICATION` (profiles de sistema/cross-region não suportam tag
   e são excluídos por construção, não por filtro posterior), depois
   `bedrock:ListTagsForResource` por profile. `tipo_recurso` do resultado:
-  `application_inference_profile`.
+  `application_inference_profile`. Se a leitura de tags de UM profile falhar,
+  o recurso ainda entra no relatório (com `tags={}`, para não ficar
+  invisível), mas a falha vira uma entrada em `falhas_descoberta` — sem
+  isso, o relatório diria "sem tag" com confiança quando na verdade o
+  estado real é desconhecido. Qualquer `ClientError` ao listar profiles
+  (`AccessDenied` incluso) também vira `falhas_descoberta` — uma versão
+  anterior tratava `AccessDenied`/`UnrecognizedClientException` como "região
+  sem Bedrock, esperado" e não registrava nada; testado e comprovado errado:
+  `AccessDenied` tipicamente indica falta de permissão IAM, não região sem
+  suporte, e as duas coisas não dão pra distinguir com segurança só pelo
+  código do erro (precisa de confirmação em sandbox, ver
+  [melhorias-futuras.md](melhorias-futuras.md)) — sem essa falha registrada,
+  uma role sem `bedrock:ListInferenceProfiles` produzia "0 profiles" com
+  confiança total em toda região, escondendo um problema de permissão real
+  na conta inteira.
 - **`discover_eks_resources`** — para cada cluster (`eks:ListClusters` +
   `DescribeCluster`): tags do cluster (`tipo_recurso="cluster"`); para cada
   node group (`ListNodegroups` + `DescribeNodegroup`): tags do node group
@@ -124,12 +174,33 @@ Três funções públicas, cada uma isolada e reutilizável nos próximos estág
   automáticas `eks:cluster-name` / `kubernetes.io/cluster/<nome>` (nodes
   self-managed, heurística best-effort documentada no código) —
   `tipo_recurso="node"`; para essas instâncias, os volumes EBS anexados
-  (`ec2:DescribeVolumes`) — `tipo_recurso="ebs_volume"`; e os load balancers
-  do cluster, identificados pelas tags de convenção do AWS Load Balancer
-  Controller (`elbv2.k8s.aws/cluster`, `kubernetes.io/cluster/<nome>` —
-  também best-effort, não há uma API que amarre LB a cluster diretamente) —
-  `tipo_recurso="load_balancer"`. Fargate on EKS nunca aparece aqui porque
+  (`ec2:DescribeVolumes`, paginado via `NextToken` e em lotes de até 100
+  IDs por filtro — `_describe_instances_all`/`_describe_volumes_all`, ver
+  `_TAMANHO_LOTE_FILTRO_EC2`) — `tipo_recurso="ebs_volume"`; e os load
+  balancers do cluster, identificados pelas tags de convenção do AWS Load
+  Balancer Controller (`elbv2.k8s.aws/cluster`, `kubernetes.io/cluster/<nome>`
+  — também best-effort, não há uma API que amarre LB a cluster diretamente)
+  — `tipo_recurso="load_balancer"`. Fargate on EKS nunca aparece aqui porque
   não gera instâncias EC2.
+
+  A listagem de load balancers da região (`describe_load_balancers` +
+  `describe_tags`) roda **uma vez só** por chamada de
+  `discover_eks_resources` (`_list_region_load_balancers_with_tags`), não
+  uma vez por cluster — `_filter_load_balancers_for_cluster` depois só
+  filtra esse resultado já coletado, sem nenhuma chamada de API adicional.
+  Antes desta correção, uma conta com N clusters EKS relistava todos os
+  load balancers da região N vezes.
+
+  Falha ao listar clusters, descrever um cluster específico, listar/descrever
+  um node group — cada um desses pontos "largos" vira uma entrada em
+  `falhas_descoberta` (com o cluster/node group envolvido continuando pulado,
+  não travando o resto da região). Falhas mais granulares dentro de um
+  cluster (um chunk de instâncias/volumes EC2, um Auto Scaling Group
+  isolado) continuam só logadas — o mesmo EC2/EBS ainda aparece no
+  relatório via `discover_generic_resources` mesmo que o enriquecimento
+  específico de EKS falhe, então o recurso em si não fica invisível, só
+  perde o `tipo_recurso` mais específico (registrado como limitação
+  conhecida em [melhorias-futuras.md](melhorias-futuras.md)).
 
   As instâncias EC2 e volumes EBS dos nodes **também** são descobertos pelo
   passo genérico (o namespace `ec2` não está em `_DEDICATED_SERVICE_CODES`),
@@ -141,10 +212,11 @@ Três funções públicas, cada uma isolada e reutilizável nos próximos estág
   como a descoberta de EKS roda depois da genérica no loop de `main.py`, a
   entrada mais específica (a do EKS) é a que sobrevive.
 
-Toda chamada de API está envolvida em `try/except ClientError` com log e
-`continue`/retorno parcial — uma falha pontual (ex.: `AccessDenied` em uma
-região, serviço não disponível em uma região) nunca aborta a execução do
-restante do script.
+Toda chamada de API está envolvida em `try/except ClientError` com log,
+`continue`/retorno parcial e (nos pontos "largos" de cada função, ver acima)
+uma entrada na lista de `falhas` devolvida — uma falha pontual (ex.:
+`AccessDenied` em uma região, serviço não disponível em uma região) nunca
+aborta a execução do restante do script.
 
 Cada recurso do relatório tem um campo `tipo_recurso` (`str | None`) —
 `None` no passo genérico (onde `servico` já identifica o recurso sem
@@ -196,6 +268,20 @@ das APIs) e `[{"key":..,"value":..}]` (Bedrock) para `dict`.
   AWS explicitamente orienta a evitar.
 - Ausência de qualquer sinal → `desconhecido`. Nunca se assume "não é IaC".
 
+**`gerenciado_por_ferramenta_aws`** (novo campo em `detect_iac`, só
+preenchido quando `tipo == "cloudformation"`): identifica pelo prefixo do
+nome da stack se o CloudFormation por trás da tag foi gerado internamente
+por uma automação da própria AWS — Elastic Beanstalk (`awseb-`), Control
+Tower (`StackSet-AWSControlTower`), Service Catalog (`SC-`) — ou por
+`eksctl` (`eksctl-`), em vez de escrito pelo cliente. **Isso nunca muda a
+decisão** (`pular_iac` continua `pular_iac`, nunca tagueado via API) — só
+existe para `decision.py` compor um `motivo` que aponte a ação real:
+"taguear via IaC" é um conselho vazio quando não existe template do
+cliente para editar (ex.: um recurso do Elastic Beanstalk — o cliente só
+usou o console do EB, nunca viu o CloudFormation por trás). `None` quando
+a stack não bate com nenhum prefixo conhecido — presumida como stack do
+próprio cliente, mantendo o `motivo` genérico de sempre.
+
 ### `ou_tree.py`
 
 `discover_ou_tree(session, account_id)`: `organizations:DescribeOrganization`
@@ -216,12 +302,42 @@ relatório (ver nota sobre EKS em `resource_discovery.py` acima), mantendo a
 final no formato descrito no `README.md` do estágio 1. Ambas são funções
 puras, sem I/O.
 
+Recebe também `falhas_descoberta` (opcional, de `main.py`) — uma entrada
+`{"regiao", "etapa", "erro"}` por falha de API capturada durante a
+descoberta (genérico/bedrock/eks), devolvida pelas próprias funções de
+`resource_discovery.py` (ver seção acima); `main.py` só concatena o que
+recebe de volta, e continua com um `except Exception` próprio como backstop
+para bug de programação genuíno, não para `ClientError` esperado. Existe
+para que "0 recursos" e "a descoberta falhou nessa região" nunca fiquem
+indistinguíveis no único artefato que a Etapa 4/dashboard consome — antes,
+uma falha de descoberta só ia para o log da execução, que nunca chega no
+push para o dashboard central.
+
 ### `decision.py`
 
 Etapa 2a — classifica cada recurso do relatório da Etapa 1 em `taguear` /
-`pular_iac` / `ja_ok` / `conflito` (regras de precedência completas no
-docstring do módulo). Puro: sem boto3, sem rede, sem leitura de arquivo —
-recebe o relatório da Etapa 1 já carregado como dict e devolve outro dict.
+`pular_iac` / `revisar_tag_similar` / `ja_ok` / `conflito` (regras de
+precedência completas no docstring do módulo). Puro: sem boto3, sem rede,
+sem leitura de arquivo — recebe o relatório da Etapa 1 já carregado como
+dict e devolve outro dict.
+
+`revisar_tag_similar`: tag `aws-apn-id` ausente, mas `tag_similar_encontrada`
+(ver `tag_status.py` acima) é verdadeiro — uma tag de grafia parecida (ex.:
+`AWS-APN-ID`) quase certamente é erro de digitação. Nunca vira `taguear`
+diretamente: aplicar `aws-apn-id` por cima via API criaria uma segunda
+chave quase-duplicada no recurso em vez de corrigir o erro original — fica
+para revisão humana. Só é verificado quando a tag está mesmo ausente e o
+recurso não é `pular_iac` (IaC detectado tem precedência: se o recurso já
+não seria tagueado via API de qualquer forma, o risco de duplicata não
+existe).
+
+`pular_iac` com `motivo` específico por ferramenta: quando
+`resource["iac"]["gerenciado_por_ferramenta_aws"]` vem preenchido (ver
+`iac_detection.py` acima), o `motivo` aponta a ferramenta certa ("configure
+a tag nas opções do Elastic Beanstalk") em vez do texto genérico "taguear
+via IaC" — que seria um conselho vazio nesses casos, já que não existe
+template do cliente para editar. A decisão continua `pular_iac` de
+qualquer forma; só o texto explicativo muda.
 
 Reaproveita `tag_status.get_tag_status`, mas **recalculado** a partir de
 `valor_tag_encontrado` (o valor bruto que a Etapa 1 já extraiu) contra o
@@ -250,25 +366,30 @@ derrubar o processamento do restante do lote.
 
 `build_decision_report` monta o relatório de saída no mesmo estilo de
 `report.build_report` (mesmas chaves de topo, agregação via `Counter`,
-`por_servico` ordenado) — é o contrato de entrada da Etapa 2b, coberta a
-seguir.
+`por_servico` ordenado) — é o contrato de entrada da Etapa 2b/2c, coberta a
+seguir. Propaga `descoberta_executada_em` a partir de
+`etapa1_report["executado_em"]` (quando a descoberta rodou, distinto do
+`executado_em` desta própria função, que sempre reflete "agora") — é o que
+`tag_execution.run_tagging_execution` usa para a checagem opcional de idade
+máxima do relatório antes de agir (`max_decision_age_hours`).
 
 ### `tag_execution.py`
 
-Etapa 2b (dry-run) e base para a Etapa 2c (execução real, ainda não
-implementada) — consome `decision.build_decision_report` (Etapa 2a) e
-decide, para cada recurso `taguear`, qual API chamar e com qual
-agrupamento. Ao contrário dos módulos anteriores, **não** é 100%
-sem-efeito: faz chamadas de leitura reais na conta (revalidação, ver
-abaixo) — mas nunca de escrita nesta etapa. Docstring completo do módulo
-cobre o raciocínio em detalhe; resumo:
+Etapas 2b (dry-run) e 2c (execução real) — a MESMA função,
+`run_tagging_execution(..., dry_run: bool)`, atende as duas (`dry_run=True`
+é o default/Etapa 2b). Consome `decision.build_decision_report` (Etapa 2a)
+e decide, para cada recurso `taguear`, qual API chamar e com qual
+agrupamento; em `dry_run=False` (Etapa 2c) chama essas APIs de verdade — é
+a primeira escrita de fato em toda a automação. Docstring completo do
+módulo cobre o raciocínio em detalhe; resumo:
 
 **Garantia estrutural (não por convenção) de que só `"taguear"` gera uma
 chamada** — `select_taggable()` é o único ponto de entrada aceito pelo
 resto do módulo. Ela converte cada recurso em um `TaggableResource`, um
 tipo que **não tem campo `decisao`**. Toda função downstream recebe
 `TaggableResource`, nunca o dict bruto da Etapa 2a — não existe caminho de
-código que aceite `pular_iac`/`ja_ok`/`conflito` como parâmetro.
+código que aceite `pular_iac`/`revisar_tag_similar`/`ja_ok`/`conflito`
+como parâmetro.
 
 **Roteamento de API** (`route_strategy`), confirmado contra a documentação
 oficial de cada API (não só a página-índice de "supported services", que é
@@ -286,38 +407,115 @@ instância/volume EC2 comuns por baixo do capô, sem necessidade de API
 dedicada — só cluster, node group e load balancer entram na tabela de
 estratégia dedicada.
 
-**Revalidação e idempotência**: antes de agir sobre cada recurso (real ou
-simulado), o orquestrador relê o estado atual da tag na AWS
-(`revalidate=True` por padrão, `--no-revalidate` desliga). Se a tag já
-estiver com o valor esperado — porque uma execução anterior já aplicou, ou
-outra automação aplicou por fora —, o recurso é reportado como
-`"ja_tagueado"` e nenhuma chamada de escrita é feita. É isso que torna
-reexecuções do mesmo relatório de decisão idempotentes por construção, sem
-nenhum arquivo de progresso: o estado da tag na AWS *é* a fonte da verdade
-de "já foi feito ou não" — combinado com o fato de que toda API de tagging
+**Revalidação, idempotência e IaC** (aplica-se aos dois modos — a
+revalidação existe independente de dry-run/live): antes de agir sobre cada
+recurso, o orquestrador relê o estado atual dele na AWS (`revalidate=True`
+por padrão, `--no-revalidate` desliga — mas **nunca aceito junto de
+`dry_run=False`**, ver `RevalidacaoObrigatoriaError` abaixo) e reaplica a
+MESMA regra de precedência de `decision.py` — não só compara o valor da
+tag (agora de verdade nos 3 caminhos de revalidação: genérico, EKS/Bedrock
+e ELB — uma versão anterior conferia IaC mas não tag similar, deixando um
+`AWS-APN-ID` criado entre a Etapa 2a e esta execução passar despercebido).
+Cinco desfechos, nesta ordem, nenhum gera chamada de escrita:
+
+1. **A leitura de revalidação FALHOU** → tem precedência sobre tudo — sem
+   saber o estado atual do recurso, a resposta segura é não arriscar
+   sobrescrever um conflito que a leitura falhou em enxergar. (Uma versão
+   anterior deixava a tentativa prosseguir nesse caso — corrigido: em modo
+   live isso significava tentar `tag:TagResources`/etc. às cegas.) Dentro
+   desse caso, o código do erro decide o resultado exato: se for um dos
+   códigos de "recurso não encontrado" (ex.: um load balancer apagado entre
+   a Etapa 1 e esta execução) → `"recurso_nao_encontrado_na_revalidacao"` —
+   mesma distinção que já existe na classificação de erro de escrita
+   (`_classificar_erro_aws`), "recurso sumiu" é o relatório da Etapa 1 estar
+   desatualizado, não deveria disparar o mesmo alerta que uma falha real;
+   qualquer outro erro (`AccessDenied`, throttling esgotado etc.) →
+   `"revalidacao_falhou"`, genérico.
+2. Valor já bate com o esperado → `"ja_tagueado"`.
+3. Valor presente e diferente do esperado → `"conflito_na_revalidacao"` —
+   nunca sobrescreve um conflito só porque ele apareceu depois da Etapa 2a.
+4. Tag ausente e IaC detectado (só quando a tag está mesmo ausente — IaC
+   nunca tem precedência sobre um conflito) → `"iac_detectado_na_revalidacao"`
+   — cobre o recurso que passou a ser gerenciado por IaC entre a Etapa 1/2a
+   e esta execução.
+5. Tag ausente, sem IaC, mas uma tag de grafia parecida apareceu entre a
+   Etapa 2a e esta execução → `"tag_similar_encontrada_na_revalidacao"` —
+   mesma razão de `decision.py`: aplicar `aws-apn-id` por cima criaria uma
+   segunda chave quase-duplicada em vez de corrigir o erro original.
+
+Isso é o que torna reexecuções idempotentes por construção, sem nenhum
+arquivo de progresso: o estado do recurso na AWS *é* a fonte da verdade de
+"já foi feito ou não" — combinado com o fato de que toda API de tagging
 usada aqui é uma operação de conjunto (aplicar o mesmo valor duas vezes é
-no-op). A leitura de revalidação usa `tag:GetResources` com
-`TagFilters=[{"Key": "aws-apn-id"}]` (uma varredura por região cobre todos
-os recursos genéricos de uma vez) para o caminho genérico, e
-`eks:ListTagsForResource` / `bedrock:ListTagsForResource` /
-`elasticloadbalancing:DescribeTags` para os caminhos dedicados — mesmos
-clients já usados por `resource_discovery.py` na Etapa 1. Falha na leitura
-de revalidação (ex.: `AccessDenied`) não bloqueia a tentativa principal —
-só perde o benefício da revalidação para aquele recurso.
+no-op). A leitura de revalidação busca o conjunto COMPLETO de tags (não só
+a `aws-apn-id`, senão não daria para checar IaC): `tag:GetResources` sem
+filtro para o caminho genérico (varredura por região, parando assim que os
+ARNs pedidos são encontrados), e `eks:ListTagsForResource` /
+`bedrock:ListTagsForResource` / `elasticloadbalancing:DescribeTags` para os
+dedicados — mesmos clients já usados por `resource_discovery.py` na Etapa
+1, e já devolvem o conjunto completo sem custo extra.
 
-**`Executor`**: único ponto de decisão entre "logar o que seria feito" e
-"fazer de verdade". `DryRunExecutor` (único que existe até a Etapa 2c) nunca
-chama uma API de escrita — só loga, no mesmo formato estruturado que vira o
-relatório de saída. Todo o roteamento/agrupamento/revalidação acima é
-comum às duas etapas; a Etapa 2c só precisa adicionar um `LiveExecutor` que
-implementa o mesmo `Protocol` chamando boto3 de verdade (incluindo o
-parsing de `FailedResourcesMap` para falha parcial de lote, que o dry-run
-não precisa simular — sempre assume sucesso, já que não há chamada real).
+`elasticloadbalancing:DescribeTags` aceita até 20 ARNs por chamada, mas 1
+load balancer inexistente no lote (ex.: apagado entre a Etapa 1 e esta
+execução) derruba a chamada inteira (`LoadBalancerNotFound`) — sem
+tratamento especial, isso marcaria os outros até 19 ARNs do mesmo lote como
+`revalidacao_falhou` também, mesmo existindo e estando OK.
+`_revalidate_elb` trata isso: quando o lote falha, tenta de novo 1 ARN por
+vez só para aquele lote, isolando qual ARN é de fato o problema em vez de
+bloquear os demais.
 
-**Formato do relatório de saída**: mesmo estilo de `report.py`/`decision.py`
-(`conta_id`, `executado_em`, `valor_tag_esperado`, `resumo` agregado via
-`Counter`, lista `recursos` com `resultado` por item) — base direta para a
-Etapa 2c e para o dashboard.
+`RevalidacaoObrigatoriaError`: `run_tagging_execution` recusa
+`dry_run=False` junto de `revalidate=False` — em live, a proteção do item
+1 acima só existe se a revalidação estiver ligada; desligar as duas coisas
+juntas removeria a única salvaguarda contra sobrescrever um conflito.
+
+**Idade máxima do relatório de decisão** (`max_decision_age_hours`,
+opcional): recusa agir (`DecisionReportDesatualizadoError`) se a descoberta
+subjacente (`decision_report["descoberta_executada_em"]`, propagado por
+`decision.build_decision_report` a partir do `executado_em` da Etapa 1) for
+mais velha que o limite. Ortogonal à revalidação: revalidação cobre "esse
+recurso mudou"; idade do relatório cobre "esse universo de recursos pode
+estar amplamente desatualizado".
+
+**`Executor`**: único ponto de decisão entre "logar o que seria feito"
+(`DryRunExecutor`, Etapa 2b) e "fazer de verdade" (`LiveExecutor`, Etapa
+2c) — mesmo `Protocol`, nunca chamado diretamente pelo resto do módulo.
+`LiveExecutor` chama a API nativa de cada estratégia (tabela acima),
+decorada com `retry.with_backoff()`, e classifica cada falha em 3
+categorias (`RESULTADO_ERRO_PERMISSAO`, `RESULTADO_RECURSO_NAO_ENCONTRADO`,
+`RESULTADO_ERRO` genérico) — inclusive falha PARCIAL de um lote
+(`FailedResourcesMap`, que pode vir num HTTP 200): só os ARNs listados ali
+viram falha, os demais do mesmo lote viram sucesso. Uma falha (de lote ou
+de recurso individual) nunca aborta o resto da execução — o próximo
+lote/recurso é tentado normalmente.
+
+**Relatório final** (`build_execution_report`): cobre as categorias que
+fazem sentido para dashboard/leitura humana — `tagueado_sucesso` (só live)
+e `simulado_sucesso` (só dry-run — as duas NUNCA se misturam na mesma
+contagem, mesmo que `categoria_final` de ambas apareça no relatório) /
+`falhou` / `pulado_iac` / `revisar_tag_similar` / `conflito` / `ja_ok` /
+`erro_classificacao` —, mesclando três grupos: os recursos `taguear`
+(resultado desta execução — inclui os pulados na revalidação, dobrados na
+categoria correspondente); os `pular_iac`/`revisar_tag_similar`/`ja_ok`/
+`conflito` que a Etapa 2a já decidiu direto, sem nunca passar por este
+módulo; e os `erros` de classificação da Etapa 2a (recursos malformados
+que nem chegaram a ser classificados — antes ficavam presos só em
+`decision_report["erros"]` e nunca apareciam no relatório desta etapa).
+Campo `origem` (`"decisao"` / `"revalidacao"` / `"execucao"`) preserva em
+qual momento a classificação foi feita — a Etapa
+4 usa isso, por exemplo, para diferenciar um conflito visto já na
+descoberta original de um conflito que só apareceu no momento da escrita
+(possível tag de outro parceiro AWS aplicada nesse meio-tempo). Mesmo
+estilo de `report.py`/`decision.py` no resto (`conta_id`, `executado_em`,
+`valor_tag_esperado`, `resumo` agregado via `Counter`).
+
+**`execucao_inicial`** (parâmetro opcional, `False` por padrão): sinal de
+observabilidade repassado ao relatório de saída, nunca usado para bloquear
+a execução. Pensado para o Lambda futuro marcar a primeira execução de uma
+conta — disparada pelo Custom Resource no `RequestType=Create` da stack,
+que já é por natureza só a primeira vez — para facilitar revisão humana
+posterior sem exigir aprovação prévia (que quebraria a automação
+hands-off).
 
 ### `retry.py`
 
@@ -344,17 +542,28 @@ arquivo de um é a entrada em arquivo do próximo), não por um orquestrador
 
 - `map` — Etapa 1. Comportamento idêntico ao script original de estágio
   único (mesmos argumentos `--expected-tag-value`/`--profile`/`--output`).
+  Falhas de descoberta por região/etapa são coletadas e passadas para
+  `report.build_report(..., falhas_descoberta=...)` — nunca só logadas.
 - `decide` — Etapa 2a. Lê `--input` (saída de `map`), escreve o relatório de
   decisão. Não usa boto3.
-- `apply` — Etapa 2b. Lê `--input` (saída de `decide`) e reaproveita
-  `valor_tag_esperado` de dentro desse relatório para a chamada a
-  `tag_execution.run_stage2b` — de propósito, **não** aceita um
-  `--expected-tag-value` próprio: aplicar um valor diferente do que foi
-  usado para classificar os recursos como `taguear` seria inconsistente
-  com a própria decisão que está sendo executada. `--no-revalidate`
-  desliga a revalidação (seção `tag_execution.py` acima); `--live` existe
-  só para dar um erro explícito ("Etapa 2c ainda não implementada") em vez
-  de a flag ser silenciosamente ignorada.
+- `apply` — Etapas 2b (default) e 2c (`--live`). Lê `--input` (saída de
+  `decide`) e reaproveita `valor_tag_esperado` de dentro desse relatório
+  para a chamada a `tag_execution.run_tagging_execution` — de propósito,
+  **não** aceita um `--expected-tag-value` próprio: aplicar um valor
+  diferente do que foi usado para classificar os recursos como `taguear`
+  seria inconsistente com a própria decisão que está sendo executada.
+  `--no-revalidate` desliga a revalidação; `--live` troca `dry_run=True`
+  (default, Etapa 2b) por `dry_run=False` (Etapa 2c — escreve de verdade);
+  `--max-decision-age-hours` liga a checagem de idade do relatório de
+  decisão (seção `tag_execution.py` acima). `--live` combinado com
+  `--no-revalidate` é recusado antes de qualquer chamada AWS (mesma
+  garantia reforçada dentro de `tag_execution.py` via
+  `RevalidacaoObrigatoriaError`, para quem chamar a função direto sem
+  passar pelo CLI).
+
+`--expected-tag-value` (`map`/`decide`) é validado contra
+`^pc:[A-Za-z0-9]+$` — erro de verdade, não só aviso, já que o formato está
+fechado para este projeto (nunca `ra-...`).
 
 ## Por que não há arquivo de variáveis de ambiente
 

@@ -1,11 +1,15 @@
 # Testes unitários
 
 Pytest, 100% offline — sem rede real, sem credencial, sem nenhuma conta AWS
-real. Cobre `decision.py` (Etapa 2a, 100% sem boto3) e `tag_execution.py`
-(Etapa 2b — usa boto3, mas os testes passam sessões/clients falsos em vez
-de rede real; ver `fake_session_factory` em `conftest.py`). Ver
-[test/localstack/README.md](../localstack/README.md) para o teste e2e da
-Etapa 1, que precisa de boto3 + LocalStack de verdade.
+real. Cobre `decision.py` (Etapa 2a, 100% sem boto3), `tag_execution.py`
+(Etapas 2b e 2c — usa boto3, mas os testes passam sessões/clients falsos em
+vez de rede real; ver `fake_session_factory` em `conftest.py`), `report.py`
+(Etapa 1, 100% sem boto3), a validação pura de `main.py`
+(`_validate_expected_tag_value`), `services.classify_arn` (também 100% sem
+boto3) e as funções puras de `resource_discovery.py` extraídas para não
+dependerem de boto3. Ver [test/localstack/README.md](../localstack/README.md)
+para o teste e2e da Etapa 1 completa (o resto de `resource_discovery.py`,
+que ainda depende de boto3), que precisa de boto3 + LocalStack de verdade.
 
 Rodar (do diretório que contém `aws_prm_tagging/` — ver ["Onde rodar os
 comandos"](../../README.md#onde-rodar-os-comandos) no README raiz):
@@ -23,7 +27,9 @@ gigante por módulo — nomeado `test_<módulo>_<área>.py`. Para `decision.py`
 
 - `test_decision_precedencia.py` — regra de precedência de
   `classify_resource` (tag ausente vs. presente, papel do IaC, tag com
-  grafia parecida).
+  grafia parecida, `motivo` específico por ferramenta AWS quando
+  `gerenciado_por_ferramenta_aws` vem preenchido — decisão continua
+  `pular_iac`, só o texto muda).
 - `test_decision_escopo.py` — filtragem de escopo por `tipo_recurso` (os 5
   sub-tipos de EKS, exclusão de Fargate e de Bedrock fora de application
   inference profile).
@@ -31,7 +37,7 @@ gigante por módulo — nomeado `test_<módulo>_<área>.py`. Para `decision.py`
   robustez a entrada malformada, resumo agregado, múltiplos
   `expected_tag_value` sem vazamento de estado.
 
-Para `tag_execution.py` (Etapa 2b):
+Para `tag_execution.py` (Etapas 2b e 2c):
 
 - `test_tag_execution_selecao.py` — garantia estrutural de `select_taggable`
   (só `decisao == "taguear"` passa) e roteamento de API por
@@ -39,11 +45,48 @@ Para `tag_execution.py` (Etapa 2b):
 - `test_tag_execution_lotes.py` — agrupamento em lotes de até 20 ARNs no
   caminho genérico, sem misturar região, e confirmação de que os caminhos
   dedicados (EKS/Bedrock/ELB) nunca são agrupados.
-- `test_tag_execution_execucao.py` — revalidação (pula recurso já
-  tagueado), idempotência entre reexecuções, dry-run nunca chamando boto3
-  de escrita, e formato do relatório de saída.
+- `test_tag_execution_execucao.py` — revalidação de 4 vias (falha de
+  leitura / já tagueado / conflito / IaC detectado, cada uma sem chamar o
+  executor — falha de leitura tem precedência sobre as outras três),
+  `--live` recusando `revalidate=False` (`RevalidacaoObrigatoriaError`),
+  idempotência entre reexecuções, dry-run nunca chamando boto3 de escrita,
+  `LiveExecutor` (sucesso, falha parcial de lote, classificação de erro),
+  idade máxima do relatório de decisão, e o merge do relatório final
+  (incluindo `revisar_tag_similar` e os `erros` de classificação da
+  Etapa 2a).
 
-Ao adicionar um módulo novo (Etapa 2c em diante), crie um novo grupo de
+Para `report.py` (Etapa 1):
+
+- `test_report_falhas_descoberta.py` — `falhas_descoberta`/
+  `total_falhas_descoberta` distinguindo "0 recursos" de "a descoberta
+  falhou aqui" no relatório.
+
+Para `main.py`:
+
+- `test_main_validacao.py` — `_validate_expected_tag_value` (formato
+  `pc:<product-code>` fechado, `ra-...` e qualquer outro formato
+  recusados).
+
+Para `iac_detection.py`:
+
+- `test_iac_detection.py` — precedência CloudFormation/Terraform,
+  heurística de Terraform em 2 níveis, e `gerenciado_por_ferramenta_aws`
+  identificado por prefixo de nome de stack (Elastic Beanstalk, Control
+  Tower, Service Catalog, eksctl).
+
+Para `services.py`:
+
+- `test_services_classify_arn.py` — desambiguação de código de produto
+  compartilhado (`vpc-lattice` classificado com nome próprio, não como
+  "AWS Transit Gateway"; regressão da desambiguação ec2 compute vs. rede).
+
+Para `resource_discovery.py` (só a parte pura, sem boto3):
+
+- `test_resource_discovery_puro.py` — `_chunk` e
+  `_filter_load_balancers_for_cluster` (filtro puro sobre o resultado já
+  coletado uma vez por região, não mais relistado a cada cluster).
+
+Ao adicionar um módulo novo (Etapa 3 em diante), crie um novo grupo de
 arquivos `test_<módulo>_<área>.py` seguindo o mesmo padrão, em vez de
 acrescentar num arquivo já existente de outro módulo.
 
