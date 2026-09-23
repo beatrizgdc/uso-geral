@@ -26,6 +26,8 @@ de teste do LocalStack (`000000000000`), região `us-east-1`:
 | Instância EC2 "inst-ok" | `pc:test123` (igual ao esperado) | `status_tag = ok` |
 | Instância EC2 "inst-sem-tag" | ausente | `status_tag = sem_tag` |
 | Instância EC2 "inst-conflito" | `pc:outrovalor` + `aws:cloudformation:stack-name=minha-stack` | `status_tag = conflito`, `iac.tipo = cloudformation` |
+| Instância EC2 "inst-terraform" | ausente + `Provisioner=Terraform` | `status_tag = sem_tag`, `iac.tipo = terraform_heuristico` (exercita o catch-all por valor, chave arbitrária) |
+| Instância EC2 "inst-tag-similar" | `AWS-APN-ID` (case diferente) = `pc:test123` | `status_tag = sem_tag` (chave exata ausente), `tag_similar_encontrada = true`, `tag_similar_chaves = ["AWS-APN-ID"]` |
 | Bucket S3 `prm-test-bucket-ok` | `pc:test123` | `status_tag = ok` |
 | Cluster EKS `prm-test-cluster` | `pc:test123` | `status_tag = ok`, `servico = Amazon EKS` |
 | Node group EKS `prm-test-ng` | `pc:test123` | `status_tag = ok`, `servico = Amazon EKS` |
@@ -79,7 +81,7 @@ O script:
    não valida credenciais).
 3. Sobe o LocalStack (`localstack start -d`) e aguarda o healthcheck.
 4. Roda `setup_test_resources.sh` para criar o cenário acima.
-5. Executa `python3 -m aws_prm_tagging.main --expected-tag-value pc:test123
+5. Executa `python3 -m aws_prm_tagging.main map --expected-tag-value pc:test123
    --profile localstack` contra o LocalStack.
 6. Imprime o resumo (`resumo`) do relatório gerado.
 
@@ -90,7 +92,7 @@ repositório (`python3 -m aws_prm_tagging.main` exige isso — ver
 ```bash
 localstack start -d
 bash aws_prm_tagging/test/localstack/setup_test_resources.sh
-python3 -m aws_prm_tagging.main \
+python3 -m aws_prm_tagging.main map \
   --expected-tag-value pc:test123 \
   --profile localstack \
   --output aws_prm_tagging/test/localstack/relatorio_teste.json
@@ -102,34 +104,36 @@ O bloco `resumo` do relatório gerado deve conter:
 
 ```json
 {
-  "total_recursos": 10,
+  "total_recursos": 12,
   "por_status_tag": {
-    "sem_tag": 5,
+    "sem_tag": 7,
     "ok": 4,
     "conflito": 1
   },
   "por_status_iac": {
     "cloudformation": 1,
-    "terraform_heuristico": 0,
-    "desconhecido": 9
+    "terraform_heuristico": 1,
+    "desconhecido": 10
   },
   "por_servico": {
-    "Amazon EC2": 7,
+    "Amazon EC2": 9,
     "Amazon EKS": 2,
     "Amazon S3": 1
-  }
+  },
+  "total_tag_similar_encontrada": 1
 }
 ```
 
 Notas sobre os números:
 
-- `total_recursos = 10` inclui os 3 recursos listados na tabela de cenário
+- `total_recursos = 12` inclui os 5 recursos listados na tabela de cenário
   mais recursos "de fundo" que o próprio LocalStack expõe (ex.: AMIs padrão
   visíveis via `ec2:DescribeInstances`/Resource Groups Tagging API, e o
   security group padrão criado junto com a VPC do cluster EKS) — variações
   pequenas nesse número entre execuções não indicam regressão, desde que os
-  3 status de tag (`ok`/`sem_tag`/`conflito`) e os 2 recursos EKS
-  (`cluster` + `nodegroup`) apareçam.
+  3 status de tag (`ok`/`sem_tag`/`conflito`), o `terraform_heuristico = 1`,
+  o `total_tag_similar_encontrada = 1` e os 2 recursos EKS (`cluster` +
+  `nodegroup`) apareçam.
 - `arvore_ou` não deve ser `null`: deve conter um root com uma OU "Producao"
   contendo a conta "Cliente Teste".
 - O log da execução deve conter uma linha `ERROR` por região mencionando

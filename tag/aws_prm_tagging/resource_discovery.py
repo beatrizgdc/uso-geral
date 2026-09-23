@@ -7,9 +7,13 @@ Estratégia:
      uma só vez, já trazendo ARN + tags atuais.
   2. Casos especiais que a API genérica não cobre corretamente (conforme o
      guia oficial): Amazon Bedrock (application inference profiles) e Amazon
-     EKS (cluster, node groups, load balancers, volumes EBS — excluindo
-     Fargate). Esses namespaces são deliberadamente omitidos do mapeamento
-     genérico para não gerar duplicatas.
+     EKS (cluster, node groups, nodes/instâncias EC2, volumes EBS, load
+     balancers — excluindo Fargate). Esses namespaces são deliberadamente
+     omitidos do mapeamento genérico para não gerar duplicatas — e, como as
+     instâncias EC2/volumes EBS dos nodes SÃO capturadas pelo passo genérico
+     de qualquer forma (não estão em `_DEDICATED_SERVICE_CODES`), o
+     resultado final é deduplicado por ARN em `report.dedupe_by_arn`,
+     mantendo a entrada mais específica (a do EKS).
 
 Nenhuma função aqui cria, altera ou remove recursos/tags.
 """
@@ -22,26 +26,54 @@ from botocore.exceptions import ClientError
 
 from .iac_detection import detect_iac
 from .services import Service, classify_arn
-from .tag_status import get_tag_status, tags_list_to_dict
+from .tag_status import find_similar_tag_keys, get_tag_status, tags_list_to_dict
 from .retry import with_backoff
 
 logger = logging.getLogger(__name__)
 
 # Serviços cobertos por lógica dedicada — nunca reclassificados no passo genérico.
+#
+# Defesa em profundidade: hoje "eks" e "bedrock" (plano, não AgentCore) nem
+# existem em `services._NAMESPACE_TO_CODE`, então `classify_arn` já devolve
+# `None` pra esses namespaces antes de qualquer coisa chegar aqui — este set
+# não é o que efetivamente exclui EKS/Bedrock da descoberta genérica agora.
+# Ele existe para continuar protegendo contra duplicata caso alguém adicione
+# "eks"/"bedrock" a `_NAMESPACE_TO_CODE` no futuro (ex.: pra cobrir um tipo de
+# recurso desses serviços que não seja tratado por resource_discovery.py).
 _DEDICATED_SERVICE_CODES = {"AmazonBedrock", "AmazonEKS"}
+
+# Valores possíveis para o campo "tipo_recurso" — só preenchido para os
+# sub-recursos de EKS e Bedrock, onde o "servico" sozinho (nome da linha do
+# CSV) não diferencia qual ARN é qual. None no passo genérico, onde o
+# "servico" já identifica o recurso sem ambiguidade.
+TIPO_RECURSO_CLUSTER = "cluster"
+TIPO_RECURSO_NODE_GROUP = "node_group"
+TIPO_RECURSO_NODE = "node"
+TIPO_RECURSO_EBS_VOLUME = "ebs_volume"
+TIPO_RECURSO_LOAD_BALANCER = "load_balancer"
+TIPO_RECURSO_APPLICATION_INFERENCE_PROFILE = "application_inference_profile"
 
 
 def _build_resource(
-    arn: str, servico: str, regiao: str, tags: dict, expected_tag_value: str
+    arn: str,
+    servico: str,
+    regiao: str,
+    tags: dict,
+    expected_tag_value: str,
+    tipo_recurso: str | None = None,
 ) -> dict:
     status_tag, valor_encontrado = get_tag_status(tags, expected_tag_value)
     iac = detect_iac(tags)
+    tag_similar_chaves = find_similar_tag_keys(tags)
     return {
         "arn": arn,
         "servico": servico,
         "regiao": regiao,
+        "tipo_recurso": tipo_recurso,
         "status_tag": status_tag,
         "valor_tag_encontrado": valor_encontrado,
+        "tag_similar_encontrada": bool(tag_similar_chaves),
+        "tag_similar_chaves": tag_similar_chaves,
         "iac": iac,
     }
 
@@ -154,7 +186,14 @@ def discover_bedrock_resources(
                     )
                     tags = {}
                 results.append(
-                    _build_resource(arn, servico_nome, region, tags, expected_tag_value)
+                    _build_resource(
+                        arn,
+                        servico_nome,
+                        region,
+                        tags,
+                        expected_tag_value,
+                        tipo_recurso=TIPO_RECURSO_APPLICATION_INFERENCE_PROFILE,
+                    )
                 )
             next_token = resp.get("nextToken")
             if not next_token:
@@ -417,7 +456,12 @@ def discover_eks_resources(
 
         results.append(
             _build_resource(
-                cluster["arn"], servico_nome, region, cluster.get("tags", {}), expected_tag_value
+                cluster["arn"],
+                servico_nome,
+                region,
+                cluster.get("tags", {}),
+                expected_tag_value,
+                tipo_recurso=TIPO_RECURSO_CLUSTER,
             )
         )
 
@@ -443,6 +487,7 @@ def discover_eks_resources(
                     region,
                     nodegroup.get("tags", {}),
                     expected_tag_value,
+                    tipo_recurso=TIPO_RECURSO_NODE_GROUP,
                 )
             )
             for asg in nodegroup.get("resources", {}).get("autoScalingGroups", []):
@@ -459,12 +504,34 @@ def discover_eks_resources(
 
         instance_ids = sorted(node_instance_ids)
         for arn, tags in _instances_arns_and_tags(ec2_client, account_id, region, instance_ids):
-            results.append(_build_resource(arn, servico_nome, region, tags, expected_tag_value))
+            results.append(
+                _build_resource(
+                    arn, servico_nome, region, tags, expected_tag_value, tipo_recurso=TIPO_RECURSO_NODE
+                )
+            )
         for arn, tags in _volumes_arns_and_tags(ec2_client, account_id, region, instance_ids):
-            results.append(_build_resource(arn, servico_nome, region, tags, expected_tag_value))
+            results.append(
+                _build_resource(
+                    arn,
+                    servico_nome,
+                    region,
+                    tags,
+                    expected_tag_value,
+                    tipo_recurso=TIPO_RECURSO_EBS_VOLUME,
+                )
+            )
 
         for arn, tags in _load_balancers_for_cluster(elbv2_client, cluster_name):
-            results.append(_build_resource(arn, servico_nome, region, tags, expected_tag_value))
+            results.append(
+                _build_resource(
+                    arn,
+                    servico_nome,
+                    region,
+                    tags,
+                    expected_tag_value,
+                    tipo_recurso=TIPO_RECURSO_LOAD_BALANCER,
+                )
+            )
 
     logger.info(
         "Região %s: %d recursos EKS encontrados (%d clusters)",
