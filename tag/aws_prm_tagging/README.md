@@ -1,8 +1,9 @@
 # Mapeamento, decisão e tagueamento para o AWS Partner Revenue Measurement (PRM)
 
 Automação de tagging AWS para atender a exigência de Resource Tagging do
-programa AWS Partner Revenue Measurement (PRM). Este repositório cobre os
-três primeiros passos de uma automação de **quatro estágios**:
+programa AWS Partner Revenue Measurement (PRM). Este repositório cobre as
+três primeiras Etapas de uma automação de **quatro Etapas**, mais um
+início de implementação da quarta:
 
 1. **Mapeamento** (Etapa 1, `map`) — descoberta somente-leitura de recursos
    e status da tag `aws-apn-id` por recurso.
@@ -22,14 +23,40 @@ três primeiros passos de uma automação de **quatro estágios**:
      completa de permissões IAM nativas por serviço** — ver
      [docs/producao.md](docs/producao.md#permissões-iam-para-a-etapa-2c-apply---live-execução-real)
      antes de usar `--live` contra qualquer conta real.
-4. Automação contínua para novos recursos (Etapa 3) e varredura recorrente
-   / auditoria (Etapa 4) — fora do escopo deste repositório por ora.
+4. **Automação contínua** (Etapa 3) — Lambda acionado por regra(s) de
+   EventBridge a cada criação de recurso em escopo, reaproveitando
+   `decision.py` (Etapa 2a) e `tag_execution.py` (Etapa 2c) sem nenhuma
+   lógica de decisão/execução duplicada. Cobre **69 dos ~85** serviços do
+   CSV — cada `eventSource`/`eventName`/campo de extração verificado contra
+   o `botocore` instalado (não vem de memória), com um teste próprio
+   (`test_event_parser_botocore.py`) que trava qualquer divergência futura
+   contra o shape real da API; os 16 que ficam de fora têm o motivo
+   documentado linha a linha (ver [event_mapping.py](event_mapping.py) e
+   [docs/melhorias-futuras.md](docs/melhorias-futuras.md)) — não são uma
+   lacuna silenciosa. Suíte de testes (`test/unit/` — número de testes
+   não fixado aqui de propósito, cresce a cada correção; rodar
+   `pytest aws_prm_tagging/test/unit/ --collect-only` para o total exato.
+   *OBS: revisar ao final do projeto se vale fixar um número aqui.*) e
+   infraestrutura como código (SAM) em [infra/](infra/README.md) —
+   **validada em sandbox** em duas rodadas (2026-09-23/24 e 2026-09-25,
+   mesma conta sandbox 335180047327): `sam deploy` real, eventos CloudTrail
+   reais capturados e deploy/teardown completo em ambas, 5 bugs reais
+   encontrados e corrigidos na primeira rodada e mais 3 pontos de uma
+   revisão de código posterior (lote de revalidação genérica via
+   `ResourceARNList`, filtro de `errorCode` nos event patterns, condição
+   `aws:TagKeys`) confirmados na segunda — ver
+   [docs/melhorias-futuras.md](docs/melhorias-futuras.md) e
+   [test/manual-live-etapa3/README.md](test/manual-live-etapa3/README.md)
+   para o roteiro e resultado completos. Varredura recorrente/auditoria
+   (Etapa 4) continua fora do escopo deste repositório.
 
-As Etapas 3-4 reaproveitam os módulos escritos aqui (`aws_prm_tagging/`,
-núcleo compartilhado — ver [docs/arquitetura.md](docs/arquitetura.md)) e
-serão empacotadas como Lambda dentro de uma stack CloudFormation, executando
-localmente em cada conta cliente (arquitetura sem acesso cross-account: cada
-conta roda sua própria automação).
+A Etapa 3 reaproveita os módulos escritos aqui (`aws_prm_tagging/`, núcleo
+compartilhado — ver [docs/arquitetura.md](docs/arquitetura.md)) e é
+empacotada como Lambda dentro de uma stack CloudFormation (ver
+[infra/README.md](infra/README.md) para o escopo exato do que já está
+implantável e o que ainda falta mesclar), executando localmente em cada
+conta cliente (arquitetura sem acesso cross-account: cada conta roda sua
+própria automação). A Etapa 4 segue o mesmo modelo, ainda não implementada.
 
 ## O que este script faz
 
@@ -70,6 +97,7 @@ Documentação completa:
 - [docs/melhorias-futuras.md](docs/melhorias-futuras.md) — pendências técnicas conhecidas e registradas, não corrigidas ainda (exigem decisão de arquitetura/produto ou têm custo maior que uma correção pontual).
 - [test/localstack/README.md](test/localstack/README.md) — cenário de teste local contra LocalStack, sem tocar em nenhuma conta AWS real.
 - [test/manual-live/README.md](test/manual-live/README.md) — smoke test manual da Etapa 2c (`apply --live`) contra 1 único recurso descartável, numa conta AWS real de sandbox.
+- [test/manual-live-etapa3/README.md](test/manual-live-etapa3/README.md) — roteiro de validação da Etapa 3 (captura de evento CloudTrail real, smoke test de ponta a ponta com deploy da stack, investigação de CodeBuild) numa conta AWS real de sandbox — elaborado, não executado.
 
 ## Onde rodar os comandos
 
@@ -285,7 +313,7 @@ Dois níveis, sem sobreposição:
 
 ## Estrutura
 
-```
+```text
 aws_prm_tagging/                             raiz deste repositório (pacote Python — este README vive aqui)
   reference/                                 material de referência (leitura humana, não lido pelo código)
     aws-prm-onboarding-guide.pdf               guia oficial AWS PRM
@@ -298,15 +326,22 @@ aws_prm_tagging/                             raiz deste repositório (pacote Pyt
   iac_detection.py                           heurística de IaC
   decision.py                                Etapa 2a — decisão de tagueamento (taguear/pular_iac/revisar_tag_similar/ja_ok/conflito)
   tag_execution.py                           Etapas 2b (dry-run) e 2c (execução real) — roteamento de API, batching, revalidação
+  tag_reads.py                               wrappers de leitura de tags nativas (EKS/Bedrock/ELBv2), compartilhados entre tag_execution.py e single_resource.py
   ou_tree.py                                 árvore de OUs da Organization
   report.py                                  monta o relatório JSON da Etapa 1
   retry.py                                   backoff exponencial para throttling
   main.py                                    CLI (subcomandos map / decide / apply)
+  event_mapping.py                           Etapa 3 — mapeamento serviço do CSV -> evento(s) de criação, gera o event pattern do EventBridge
+  event_parser.py                            Etapa 3 — extrai o(s) recurso(s) recém-criado(s) a partir do payload do evento
+  single_resource.py                         Etapa 3 — lê o estado atual de UM recurso (sem descoberta completa)
+  publish.py                                 publicação de resultados no SNS central (núcleo compartilhado — Etapa 3 e futura Etapa 4)
+  handler_continuous_tagging.py              Etapa 3 — handler Lambda (I/O only; reaproveita decision.py e tag_execution.py)
+  infra/                                     SAM/CloudFormation da Etapa 3 (Lambda, Step Functions, EventBridge, SNS) — ver infra/README.md
   requirements.txt                           dependências de runtime (boto3)
-  requirements-dev.txt                       dependências de desenvolvimento (pytest)
+  requirements-dev.txt                       dependências de desenvolvimento (pytest, pyyaml)
   docs/                                      documentação de arquitetura, produção e rollout multi-cliente
   test/
-    unit/                                    testes pytest (offline, sem AWS) — Etapas 2a, 2b e 2c
+    unit/                                    testes pytest (offline, sem AWS) — Etapas 2a, 2b, 2c e 3
     localstack/                              teste de ponta a ponta contra LocalStack (sem AWS real) — Etapa 1
 ```
 

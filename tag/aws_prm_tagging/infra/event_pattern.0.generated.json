@@ -1,0 +1,266 @@
+{
+  "detail-type": [
+    "AWS API Call via CloudTrail"
+  ],
+  "$or": [
+    {
+      "source": [
+        "aws.acm-pca"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateCertificateAuthority"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.acm"
+      ],
+      "detail": {
+        "eventName": [
+          "RequestCertificate"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.apigateway"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateApi",
+          "CreateRestApi"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.appsync"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateGraphqlApi"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.athena"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateDataCatalog",
+          "CreateWorkGroup"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.backup"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateBackupPlan",
+          "CreateBackupVault"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.bedrock"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateInferenceProfile"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.cassandra"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateKeyspace",
+          "CreateTable"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.clouddirectory"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateDirectory"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.cloudfront"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateDistribution"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.cloudhsm"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateCluster"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.codebuild"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateProject"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.codepipeline"
+      ],
+      "detail": {
+        "eventName": [
+          "CreatePipeline"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.cognito-identity"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateIdentityPool"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.cognito-idp"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateUserPool"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.connect"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateInstance"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.datapipeline"
+      ],
+      "detail": {
+        "eventName": [
+          "CreatePipeline"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    }
+  ]
+}

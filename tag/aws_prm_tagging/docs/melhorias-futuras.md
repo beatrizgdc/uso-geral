@@ -13,6 +13,340 @@ mapeamento contrato↔OU, etc.) ficam em
 [arquitetura-multicliente.md](arquitetura-multicliente.md#pontos-em-aberto-resumo),
 não aqui.
 
+## Pendências da Etapa 3 (automação contínua)
+
+Decisões explicitamente adiadas durante a implementação inicial da Etapa 3
+(EventBridge + Step Functions + Lambda), combinadas com o gestor do
+projeto — cada uma com o porquê de não ter entrado agora.
+
+Cada item abaixo tem uma **classificação**: `melhoria futura` significa que
+a Etapa 3, hoje, já funciona corretamente sem esse item — a ausência dele
+se degrada com segurança (falha reportada, nunca uma ação de tagueamento
+errada) e não bloqueia nem é pré-requisito para nenhuma etapa seguinte;
+entra quando houver decisão de produto ou dado de produção que justifique.
+Nenhuma pendência aberta aqui é bloqueante hoje.
+
+### Mapeamento evento→serviço — 69 de ~85 serviços cobertos, 16 conscientemente de fora
+
+**Classificação: melhoria futura.** Não bloqueia a Etapa 3 (os 16 ficam
+`None` explicitamente, sem tentativa de tagueamento incorreta) nem é
+pré-requisito da Etapa 4 (que varre o estado final do recurso, não depende
+de evento de criação).
+
+**Atualizado.** Uma primeira versão deste item registrava cobertura de
+~25/85 serviços, "de memória". Revisitado usando o `botocore` instalado
+localmente como fonte de verdade (`session.get_service_model(...)` dá o
+nome exato de cada operação de API e o `signingName`/`endpointPrefix` real
+de cada serviço — a base do `eventSource` do CloudTrail) — cobertura hoje é
+**69 dos ~85 `product_service_code`** (92 eventos de criação no total).
+Esse processo já corrigiu **3 bugs reais** que a versão anterior tinha
+(fonte errada para `AmazonKinesisAnalytics`, `AmazonTimestream` e
+`CloudHSM`) e **confirmou** (não só supôs) que `AmazonDocDB`/`AmazonNeptune`
+genuinamente não são distinguíveis por evento — os pacotes SDK
+`docdb`/`neptune` têm `endpointPrefix`/`signingName` = `rds`, ou seja usam o
+MESMO endpoint que RDS/Aurora. Três achados novos entraram na cobertura:
+`AuroraDSQL`, `AWSM2` e `AmazonMCS` (Amazon Keyspaces) — este último tinha
+sido descartado por engano numa versão anterior por supor, sem checar, que
+só existia a API CQL (data-plane); na verdade o control-plane
+(`CreateKeyspace`/`CreateTable`) é uma API REST normal.
+
+**Os 16 que continuam `None`**, com contagem real de operações `Create*`
+verificada via botocore (não estimativa): `AmazonSageMaker` (72!),
+`AmazonQuickSight` (34), `AWSGlue` (31), `AmazonBedrockAgentCore` (29),
+`AWSIoT` (32), `AmazonAppStream` (17), `AWSDataSync`/`AWSDeadlineCloud` (13
+cada), `AmazonOmics` (12), `AWSSecurityHub` (11, nível de conta — não
+"criação de recurso" no sentido usual), `AWSElasticDisasterRecovery` (6,
+replicação contínua, nenhuma operação é uma criação de recurso "normal"),
+`comprehend` (5, jobs/endpoints sem recurso persistente óbvio),
+`AWSIoTSiteWise`, `AmazonDocDB`, `AmazonNeptune` (ambiguidade confirmada,
+ver acima) e `AWSCodeStar` (descontinuado pela AWS, sem definição no
+botocore instalado).
+
+**Por que não foi resolvido 100%:** os 16 restantes são genuinamente
+ambíguos (múltiplos tipos de recurso sem "o" recurso óbvio para PRM) ou têm
+uma ambiguidade estrutural real (DocDB/Neptune) — mapear errado aqui tem
+custo real (evento mapeado errado nunca dispara silenciosamente, ou o
+recurso errado é tagueado como se fosse outro serviço). O CSV é atualizado
+manualmente (decisão do gestor) — este mapeamento segue o mesmo modelo:
+extensão incremental quando houver prioridade de negócio clara, não um
+trabalho de "resolver tudo de uma vez".
+
+**O que destrava:** priorizar, com o gestor/PDM, se algum dos 16 restantes
+(SageMaker e QuickSight à parte — ambíguos demais para valer a pena sem uma
+decisão de produto sobre qual sub-recurso importa) é usado o suficiente
+pelos clientes da Darede para justificar escolher um recurso "principal"
+por decisão de produto (não só técnica) e mapear só esse.
+
+### Alerta ativo quando o CSV ganha um serviço sem mapeamento de evento
+
+**Classificação: melhoria futura.** Não bloqueia a Etapa 3 hoje (o teste
+`validate_against_csv` já trava a divergência em desenvolvimento) e é
+candidato natural para nascer junto da Etapa 4, não um pré-requisito dela.
+
+**O quê:** `validate_against_csv()` já trava a divergência em tempo de
+desenvolvimento (o teste `test_event_mapping.py` falha se o CSV tiver um
+`product_service_code` sem nenhuma entrada na tabela). O que ainda não
+existe é um alerta em PRODUÇÃO quando isso acontece — hoje o comportamento é
+silencioso: o serviço simplesmente não é observado pela Etapa 3 até alguém
+mapear.
+
+**Por que não foi resolvido agora:** decisão do gestor — registrar como
+melhoria em vez de implementar agora.
+
+**O que destrava:** desenhar um mecanismo (ideia do gestor: um e-mail via
+SNS) que rode periodicamente (ou no deploy) comparando o CSV vigente contra
+`event_mapping.py` e alertando quando há um `product_service_code` novo sem
+mapeamento — candidato natural para rodar junto da Etapa 4 quando ela for
+implementada.
+
+### Extractor do CloudFront (`CreateDistribution`) nunca testado contra evento real
+
+**O quê:** de todos os serviços de protocolo `query`/`ec2`/`rest-xml`
+(capitalização do CloudTrail incerta — ver docstring de `event_parser.py`),
+só o CloudFront segue sem um evento real capturado em sandbox — os outros
+8 já foram (`test/unit/test_event_parser_botocore.py` verifica
+estruturalmente todos contra o botocore, sem custo de conta real; ver
+[test/manual-live-etapa3/README.md](../test/manual-live-etapa3/README.md#parte-1--capturar-eventos-cloudtrail-reais-sem-implantar-a-stack)
+para o resultado dos demais — 3 tinham bug real, já corrigidos).
+
+**Por que não foi testado ainda:** custo de tempo, não de dinheiro — a
+distribuição leva 15-20min pra propagar antes de poder ser desabilitada e
+apagada.
+
+**O que destrava:** capturar o evento `CreateDistribution` em sandbox
+(mesmo roteiro da Parte 1) quando o tempo de espera for aceitável.
+Continua com leitura tolerante a capitalização (`_direct_ci`/
+`_constructed_ci`) como mitigação até lá, não substituto.
+
+### Corrida com IaC — debounce de 30 minutos, sem validação de tempo real
+
+**O quê:** `DebounceSeconds` (Step Functions `Wait`) tem default de 1800s
+(30 minutos), combinado explicitamente com o gestor como ponto de partida.
+
+**Por que não foi resolvido com mais precisão:** não há dado real de quanto
+tempo as ferramentas de IaC usadas pelos clientes da Darede (Terraform,
+CloudFormation, `eksctl`, etc.) levam entre criar um recurso e aplicar suas
+próprias tags — 30 minutos é uma margem confortável, mas não validada.
+
+**O que destrava:** observar, depois de alguns meses em produção, quantos
+recursos resultam em `taguear` que na verdade eram gerenciados por IaC
+(sinal indireto: o próprio IaC re-tagueando por cima na consolidação
+seguinte causaria um falso "conflito" no relatório) — ajustar o debounce
+para cima ou para baixo com esse dado.
+
+### Buffer SQS entre EventBridge e o processamento — não implementado
+
+**Classificação: melhoria futura.** Decisão consciente já tomada com o
+gestor de manter o desenho simples por ora; reativa a dado de throttling em
+produção que ainda não existe — não bloqueia a Etapa 3 nem é pré-requisito
+de nenhuma etapa seguinte.
+
+**O quê:** decisão explícita do gestor: manter invocação direta do Step
+Functions pela regra do EventBridge, sem fila SQS no meio.
+
+**Por que não foi resolvido agora:** decisão consciente de manter o desenho
+mais simples por ora — SQS ajudaria a suavizar rajadas de criação de
+recurso (ex.: Auto Scaling), mas adiciona um componente a mais e não há
+dado real de que o volume atual de algum cliente justifique isso.
+
+**O que destrava:** monitorar `Throttles`/erros de concorrência da função
+Lambda (`Etapa3Function`) e do Step Functions em produção; se rajadas
+causarem throttling real de API, inserir uma fila SQS entre a regra do
+EventBridge e o Step Functions (ou entre o Step Functions e o Lambda).
+
+### Load balancer/node/volume de EKS criados dinamicamente — deferido à Etapa 4
+
+**O quê:** um Load Balancer criado por um Ingress Controller do EKS gera
+sim um evento `elasticloadbalancing:CreateLoadBalancer` observável — mas,
+no momento exato do evento, a tag de convenção que permitiria associá-lo a
+um cluster específico (`elbv2.k8s.aws/cluster`) normalmente ainda não foi
+aplicada (o controller faz isso numa chamada `AddTags` separada, logo
+depois). Nodes/volumes EBS de node groups managed em geral JÁ vêm com essas
+tags no próprio `RunInstances`/`CreateVolume` (via `TagSpecifications` do
+launch template), mas isso não é garantido para todo node group.
+
+**Por que não foi resolvido agora:** decisão explícita do gestor — esses 3
+subtipos de recurso EKS ficam de fora da detecção por evento da Etapa 3;
+continuam cobertos pelo scan periódico da Etapa 4 (fora do escopo deste
+repositório), que já lê o estado final consolidado do recurso, sem essa
+janela de corrida.
+
+**O que destrava:** nada a fazer aqui — comportamento intencional. Só
+revisitar se a Etapa 4 acabar não cobrindo esse gap na prática (ex.: se o
+intervalo entre varreduras da Etapa 4 for longo demais para o SLA de
+compliance desejado).
+
+### Falha de extração de evento — decisão de alertar ainda em aberto
+
+**Classificação: melhoria futura.** Hoje já se degrada com segurança (só
+loga `WARNING`, nenhuma ação incorreta) — não bloqueia a Etapa 3; pode
+reaproveitar o mesmo mecanismo do item "Alerta ativo quando o CSV ganha um
+serviço sem mapeamento" acima quando esse for priorizado.
+
+**O quê:** quando `event_parser.parse_creation_event` não consegue extrair
+nenhum recurso (payload insuficiente, evento sem extractor confiável), o
+handler hoje só loga um `WARNING` — não publica nada no SNS.
+
+**Por que não foi resolvido agora:** decisão do gestor — registrar como
+melhoria em vez de decidir agora entre "alertar via SNS" (mais visível, mas
+gera ruído para casos esperados) e "só logar" (mais simples, mas depende de
+alguém observar o CloudWatch Logs ativamente).
+
+**O que destrava:** decisão de produto sobre o nível de alerta desejado
+para esse caso, e possivelmente reaproveitar o mesmo mecanismo do item
+"Alerta ativo quando o CSV ganha um serviço sem mapeamento" acima.
+
+### DLQ para o alvo do EventBridge — não implementado
+
+**Classificação: melhoria futura.** Mesma decisão do buffer SQS acima —
+não bloqueia a Etapa 3 nem é pré-requisito de nenhuma etapa seguinte, só
+vem natural junto se/quando uma fila for adicionada à arquitetura.
+
+**O quê:** as regras do EventBridge têm `RetryPolicy` (2 tentativas,
+`MaximumEventAgeInSeconds` configurável), mas nenhum
+`DeadLetterConfig` — um evento que esgote as tentativas de entrega ao Step
+Functions é simplesmente descartado, sem rastro.
+
+**Por que não foi resolvido agora:** adicionar um DLQ de verdade exige uma
+fila SQS dedicada (o EventBridge só suporta DLQ via SQS) — coerente com a
+decisão de manter o desenho sem SQS por ora (ver item acima); ficou de fora
+junto.
+
+**O que destrava:** mesma decisão do buffer SQS acima — se/quando uma fila
+for adicionada à arquitetura, o DLQ vem natural junto dela.
+
+### A stack cobre só 1 região — qualquer recurso regional fora dela fica invisível (Route 53/CloudFront são só o caso mais extremo)
+
+**Classificação: melhoria planejada — decisão de arquitetura já tomada
+com o gestor (2026-09-25), implementação ainda não feita.**
+
+**O quê:** uma regra de EventBridge só casa eventos da MESMA região onde
+ela foi criada — isso vale para QUALQUER serviço regional (EC2, RDS, S3,
+Lambda, todos os ~69 mapeados). Hoje `template.yaml` implanta a Etapa 3
+numa única região por deploy — **todo recurso criado em qualquer outra
+região da mesma conta fica invisível para a Etapa 3**, silenciosamente
+(evento nunca chega, não é uma tentativa de escrita que falha com erro
+visível). Contas de cliente que operam em mais de uma região (comum) têm
+esse gap para a maioria dos recursos que criam, não só para Route
+53/CloudFront.
+
+**Route 53/CloudFront são um caso à parte, mais restritivo ainda**:
+confirmado empiricamente em sandbox em 2026-09-24 (reproduzido: `aws
+cloudtrail lookup-events` para `CreateHostedZone` devolveu 0 resultados
+consultado em `us-east-2`, e 1 resultado — com `awsRegion: us-east-1`
+gravado no próprio evento — na mesma consulta em `us-east-1`, mesmo com o
+perfil AWS configurado para `us-east-2`) — a AWS entrega evento de
+CloudTrail de serviço GLOBAL **só** ao barramento do EventBridge em
+`us-east-1`, nunca ao de nenhuma outra região, mesmo que essa seja a
+região "principal" da stack.
+
+**Decisão registrada — opção (a) do leque anterior**: StackSet em todas
+as regiões ativas da conta cliente, sempre incluindo `us-east-1` mesmo que
+a conta não tenha recurso lá (única forma de cobrir Route
+53/CloudFront). Descartadas: (b) aceitar o gap e delegar à Etapa 4 —
+perde a reação em tempo real exatamente nas contas multi-região, que
+tendem a ser as maiores/mais maduras; (c) fixar a região principal em
+`us-east-1` — não resolve o caso regional geral.
+
+**Desenho da implementação (ainda não feita):**
+
+1. **Separar `template.yaml` em dois templates.** Hoje o tópico SNS
+   (`PrmComplianceTopic`) vive na mesma stack que Lambda/Step
+   Functions/EventBridge — duplicar tudo por região duplicaria o tópico
+   também, quebrando a regra já registrada de que ele é peça
+   compartilhada única por conta (ver docstring do template e a seção do
+   e-mail de notificação acima). Precisa virar:
+   - **Template "hub"** (implantado 1x por conta, região principal): só o
+     tópico SNS + a assinatura de e-mail (`NotificationEmail`, ver acima).
+   - **Template "regional"** (o que existe hoje, menos o tópico SNS):
+     Lambda, Step Functions, EventBridge, IAM — recebe o ARN do tópico do
+     hub como parâmetro simples (publicar num tópico SNS de outra região
+     funciona apontando o client boto3 pra região do tópico — não precisa
+     de `Fn::ImportValue` cross-region nem de nenhum truque).
+2. **Descobrir as regiões ativas da conta cliente** para alimentar o
+   StackSet — reaproveitar `regions.get_active_regions()` (já existe,
+   mesmo código que a Etapa 1 usa), rodado uma vez por conta antes do
+   deploy, **sempre forçando a inclusão de `us-east-1`** na lista mesmo
+   quando a conta não reporta recurso lá.
+3. **Pré-requisito de conta/organização**: StackSet de verdade (não só
+   `sam deploy` manual por região) precisa de trusted access configurado
+   entre a conta de gerenciamento e as contas de cliente (ou roles
+   self-managed) — a confirmar se já está habilitado antes de implementar
+   isso de fato.
+4. **Custo**: praticamente nenhum de infra ociosa — Lambda/Step Functions
+   só cobram por execução, EventBridge/IAM são gratuitos; o custo real é
+   só mais peças pra gerenciar por conta.
+5. **Validação**: precisa de um novo roteiro em sandbox (deploy em 2+
+   regiões, confirmar que cada região só reage a evento local, e que as
+   duas publicam no mesmo tópico do hub) antes de considerar resolvido —
+   mesma disciplina já seguida para o resto da Etapa 3.
+
+**O que destrava:** implementar o split de template (passo 1) e a
+descoberta de regiões (passo 2) — a decisão de abordagem já está tomada,
+falta só o trabalho.
+
+### Volumes EBS criados junto com a instância (`RunInstances`) não são tagueados
+
+**Classificação: gap de cobertura confirmado no código, correção de
+escopo pequeno mas não trivial (precisa de evento real para confirmar o
+shape).** `event_parser._ext_ec2_run_instances` (`event_parser.py`) só
+extrai `instancesSet.items[].instanceId` do evento — nunca olha os volumes
+EBS anexados na mesma chamada (`items[].blockDeviceMapping.items[].ebs.
+volumeId` no shape esperado da API EC2, protocolo `ec2` com o mesmo
+empacotamento `"xSet": {"items": [...]}` já documentado para esse
+extractor). Toda instância criada com `RunInstances` tem pelo menos 1
+volume root — hoje esse volume só é pego pela Etapa 1 (descoberta
+completa), nunca pela Etapa 3 (reação em tempo real).
+
+**Por que não foi corrigido agora:** o shape exato de
+`blockDeviceMapping` num evento CloudTrail real de `RunInstances` não foi
+capturado nesta sessão (não estava na lista priorizada de serviços
+incertos, já que EC2 tem um shape de CloudTrail conhecido/estável para a
+parte de instância — mas a parte de `blockDeviceMapping` especificamente
+não foi verificada contra um evento real, só contra suposição de estrutura
+análoga).
+
+**O que destrava:** capturar um evento `RunInstances` real em sandbox
+(mesmo padrão do roteiro em
+[test/manual-live-etapa3/README.md](../test/manual-live-etapa3/README.md)),
+confirmar o path exato de `blockDeviceMapping`/`ebs`/`volumeId`, estender
+`_ext_ec2_run_instances` para devolver também os ARNs dos volumes, e
+adicionar regressão em `test_event_parser_extracao.py`.
+
+### Formas de criar recurso que não passam pelo evento esperado
+
+**Classificação: melhoria futura de cobertura — decisão de priorização,
+não bug de um evento mapeado errado.** Vários jeitos comuns de criar um
+recurso não disparam o `eventName` que `event_mapping.py` espera para
+aquele serviço, então passam batido pela Etapa 3 mesmo com o serviço
+"mapeado":
+
+- `ec2:CreateFleet` (usado por ferramentas de auto-scaling baseadas em
+  Spot/Fleet, ex. Karpenter) não é `RunInstances` — instâncias criadas
+  assim não geram o evento que o extractor de EC2 espera.
+- `rds:RestoreDBInstanceFromDBSnapshot`/`RestoreDBInstanceToPointInTime`/
+  `CreateDBInstanceReadReplica` são formas de criar um DB instance/cluster
+  sem passar por `CreateDBInstance`/`CreateDBCluster`.
+- `dynamodb:RestoreTableFromBackup`/`RestoreTableToPointInTime` — mesma
+  lógica para DynamoDB.
+- NAT Gateway (`ec2:CreateNatGateway`), Elastic IP
+  (`ec2:AllocateAddress`) e snapshots (`ec2:CreateSnapshot`,
+  `rds:CreateDBSnapshot` etc.) não têm evento mapeado — recursos comuns e
+  de custo real que ficam fora da automação.
+
+**Por que não foi corrigido agora:** cada um exigiria mapear um evento
+novo (`event_mapping.py`) + um extractor novo (`event_parser.py`), o mesmo
+processo já usado para os 69 mapeados — trabalho incremental de mesma
+natureza do item "16 serviços sem mapeamento" acima, não algo a resolver
+de uma vez. Karpenter/`CreateFleet` em particular merece prioridade alta
+se algum cliente usa Karpenter para EKS (cenário comum), mas isso é
+julgamento de produto sobre a base de clientes, não técnico.
+
+**O que destrava:** priorizar com o gestor quais desses valem o esforço de
+mapear agora vs. esperar dado real de uso pelos clientes da Darede —
+`CreateFleet` (Karpenter) parece o candidato mais forte a entrar cedo,
+dado quão comum é hoje em clusters EKS gerenciados com auto-scaling.
+
 ## Cobertura de recursos que nunca tiveram tag nenhuma
 
 **O quê:** `resourcegroupstaggingapi:GetResources` (usado por
@@ -302,15 +636,16 @@ organizado. Baixa prioridade, sem prazo:
   arquivo é docstring). Vale dividir em módulos menores (revalidação,
   executores, relatório) quando o arquivo crescer mais — hoje ainda é
   navegável.
-- **Duplicação de constantes E de funções entre módulos** — `"Amazon
-  EKS"`/`"Amazon Bedrock"` como string literal, o conjunto de tipos de IaC
-  "detectado" (`_IAC_DETECTADO`), os `tipo_recurso` de EKS/Bedrock —
-  repetidos em `decision.py`, `tag_execution.py` e `resource_discovery.py`.
-  Um `constants.py` compartilhado resolveria, mas é uma mudança que toca os
-  3 módulos de uma vez. Além das constantes, `_chunk` (idêntica) e
-  `_get_resources_page` (praticamente idêntica) existem hoje tanto em
-  `resource_discovery.py` quanto em `tag_execution.py` — mesmo caso, um
-  módulo utilitário compartilhado resolveria as duas coisas juntas.
+- **Duplicação de constantes entre módulos** — `"Amazon EKS"`/`"Amazon
+  Bedrock"` como string literal, o conjunto de tipos de IaC "detectado"
+  (`_IAC_DETECTADO`), os `tipo_recurso` de EKS/Bedrock — repetidos em
+  `decision.py`, `tag_execution.py`, `resource_discovery.py` e
+  `single_resource.py` (Etapa 3). Um `constants.py` compartilhado
+  resolveria, mas é uma mudança que toca vários módulos de uma vez. Além
+  das constantes, `_chunk` (idêntica) e `_get_resources_page` (praticamente
+  idêntica) existem hoje tanto em `resource_discovery.py` quanto em
+  `tag_execution.py` — mesmo caso, um módulo utilitário compartilhado
+  resolveria as duas coisas juntas.
 - **`retry.py` é um retry próprio** — o botocore já oferece
   `Config(retries={"mode": "adaptive"})` nativamente. Trocar exigiria
   reavaliar se a diferenciação atual entre "erro retryable" (throttling) e

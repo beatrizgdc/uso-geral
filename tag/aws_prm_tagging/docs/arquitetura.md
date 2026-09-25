@@ -32,29 +32,38 @@ seções `decision.py`/`tag_execution.py` abaixo.
 Nenhuma dessas funções tem efeito colateral sobre a conta AWS: todas usam
 exclusivamente operações `Describe*`/`List*`/`Get*`.
 
-## Núcleo compartilhado vs. entrypoint de estágio
+## Núcleo compartilhado vs. entrypoint de Etapa
 
 Todo módulo no nível raiz do pacote (`services.py`, `regions.py`,
 `resource_discovery.py`, `tag_status.py`, `iac_detection.py`, `decision.py`,
-`tag_execution.py`, `ou_tree.py`, `report.py`, `retry.py`) é **núcleo
-compartilhado**: pode ser importado por qualquer um dos 4 estágios sem saber
-qual estágio está chamando. `decision.py` (Etapa 2a) e `tag_execution.py`
-(Etapas 2b/2c) estão aqui pelo mesmo motivo que `resource_discovery.py`
-está — a Etapa 3 (automação contínua) e a Etapa 4 (varredura recorrente)
-também vão precisar classificar e aplicar a tag, não só a Etapa 2.
+`tag_execution.py`, `tag_reads.py`, `ou_tree.py`, `report.py`, `retry.py`,
+`event_mapping.py`, `event_parser.py`, `single_resource.py`, `publish.py`) é
+**núcleo compartilhado**: pode ser importado por qualquer uma das 4 Etapas
+sem saber qual Etapa está chamando. `decision.py` (Etapa 2a) e
+`tag_execution.py` (Etapas 2b/2c) estão aqui pelo mesmo motivo que
+`resource_discovery.py` está — a Etapa 3 (automação contínua) e a Etapa 4
+(varredura recorrente) também precisam classificar e aplicar a tag, não só
+a Etapa 2; `publish.py` segue o mesmo princípio para o lado de reporte
+(Etapa 3 é quem primeiro precisou publicar algo, mas a Etapa 4 reaproveita
+o mesmo módulo depois). `tag_reads.py` entra pelo mesmo critério: é
+importado tanto por `tag_execution.py` (Etapas 2b/2c) quanto por
+`single_resource.py` (Etapa 3) — ver seção própria abaixo.
 
-Só `main.py` é **entrypoint de estágio**: hoje um único CLI com 3
-subcomandos, um por estágio implementado (`map`, `decide`, `apply` — ver
-[README.md](../README.md#uso)), cada um orquestrando só o I/O específico
-daquele estágio (CLI args + leitura/escrita de arquivo). Quando as Etapas
-3-4 ganharem seus próprios entrypoints (handlers Lambda, ver
-[arquitetura-multicliente.md](arquitetura-multicliente.md)), eles seguem o
-mesmo padrão: importam os módulos do núcleo em vez de duplicar lógica.
-`apply` cobre tanto a Etapa 2b (`--live` omitido, default — só leitura na
-conta, para revalidação) quanto a Etapa 2c (`--live` — primeira escrita de
-fato em toda a automação); é a mesma função (`tag_execution.run_tagging_execution`)
-nos dois casos, só trocando qual `Executor` está por baixo (ver
-`tag_execution.py` abaixo).
+Dois módulos são **entrypoint de Etapa**: `main.py` (CLI com 3
+subcomandos, um por Etapa implementada como CLI — `map`, `decide`, `apply`
+— ver [README.md](../README.md#uso)) e `handler_continuous_tagging.py`
+(handler Lambda da Etapa 3, invocado pelo Step Functions — ver
+[infra/README.md](../infra/README.md)). Os dois seguem o mesmo padrão: só
+orquestram I/O específico da Etapa (args de CLI / variáveis de ambiente e
+sessão boto3), importando os módulos do núcleo em vez de duplicar lógica.
+Quando a Etapa 4 ganhar seu próprio entrypoint (handler Lambda agendado),
+segue o mesmo padrão dos dois acima. `apply` cobre tanto a Etapa 2b
+(`--live` omitido, default — só leitura na conta, para revalidação) quanto
+a Etapa 2c (`--live` — primeira escrita de fato em toda a automação); é a
+mesma função (`tag_execution.run_tagging_execution`) nos dois casos, só
+trocando qual `Executor` está por baixo (ver `tag_execution.py` abaixo) —
+`handler_continuous_tagging.py` (Etapa 3) chama essa MESMA função, com
+`dry_run=False`, sobre um relatório de decisão de um único recurso.
 
 ## Módulos
 
@@ -114,8 +123,8 @@ comerciais.
 
 ### `resource_discovery.py`
 
-Três funções públicas, cada uma isolada e reutilizável nos próximos
-estágios. Todas devolvem `(recursos, falhas)` — `falhas` é uma lista de
+Três funções públicas, cada uma isolada e reutilizável nas próximas
+Etapas. Todas devolvem `(recursos, falhas)` — `falhas` é uma lista de
 dicts `{"regiao", "etapa", "erro"}` no mesmo formato que `main.py` grava em
 `falhas_descoberta` (ver `report.py` abaixo): uma `ClientError` capturada
 durante a descoberta (ex.: `AccessDenied`, throttling esgotado, falha no
@@ -299,7 +308,7 @@ relatório (ver nota sobre EKS em `resource_discovery.py` acima), mantendo a
 `build_report`. `build_report` agrega a lista (já deduplicada) em contadores
 (`por_status_tag`, `por_status_iac`, `por_servico`,
 `total_tag_similar_encontrada` — ver `tag_status.py` acima) e monta o JSON
-final no formato descrito no `README.md` do estágio 1. Ambas são funções
+final no formato descrito no `README.md` da Etapa 1. Ambas são funções
 puras, sem I/O.
 
 Recebe também `falhas_descoberta` (opcional, de `main.py`) — uma entrada
@@ -527,21 +536,169 @@ especificamente para códigos de erro de throttling
 outro erro (ex.: `AccessDeniedException`) propaga imediatamente — não faz
 sentido re-tentar um erro de permissão.
 
+### `tag_reads.py`
+
+Wrappers de baixo nível — 1 chamada de API nativa por tipo de recurso
+dedicado (EKS, Bedrock, ELBv2), cada uma decorada com `retry.with_backoff()`
+— compartilhados entre `single_resource.py` (Etapa 3, lê 1 ARN por vez) e
+`tag_execution.py` (Etapas 2b/2c, revalida em lote). Extraído para eliminar
+a duplicação de código que existia entre os dois chamadores (mesma chamada
+de API, implementada duas vezes) — ver
+[melhorias-futuras.md](melhorias-futuras.md#refatorações-de-código-sem-risco-de-comportamento).
+Só encapsula a chamada crua do boto3; nenhuma lógica de negócio (formato de
+saída, agrupamento em lote, tratamento de erro por ARN) mora aqui — isso
+continua específico de cada chamador. O caminho genérico
+(`resourcegroupstaggingapi:GetResources`) fica de fora de propósito:
+`single_resource.py` consulta 1 ARN específico, `tag_execution.py` pagina a
+região inteira sem filtro — usos genuinamente diferentes da mesma API, não
+uma duplicação.
+
+### `event_mapping.py` (Etapa 3)
+
+Tabela `product_service_code` (do CSV oficial) -> evento(s) de criação de
+recurso (`eventSource`/`eventName` do CloudTrail), indexada pela mesma
+`services.load_services()` — nunca uma segunda lista de serviços própria.
+`validate_against_csv()` é a rede de segurança contra divergência silenciosa
+com o CSV (testada em `test_event_mapping.py`): toda entrada do CSV precisa
+ter uma linha aqui, mesmo que `None` (ainda não mapeada).
+
+**Cobertura**: hoje cobre **69 dos ~85** serviços do CSV (92 eventos) —
+`eventSource`/`eventName` de cada linha checados contra o `botocore`
+instalado (`session.get_service_model(...)`, que dá o nome exato de cada
+operação e o `signingName`/`endpointPrefix` real de cada serviço), não só
+de memória — esse processo já corrigiu 3 erros reais numa versão anterior
+deste módulo (fonte errada para `AmazonKinesisAnalytics`,
+`AmazonTimestream` e `CloudHSM`) e confirmou (não só supôs) que
+`AmazonDocDB`/`AmazonNeptune` genuinamente não são distinguíveis por evento
+(mesmo `endpointPrefix`/`signingName` do RDS). Os 16 que ficam `None` têm o
+motivo documentado linha a linha (contagem real de operações `Create*` via
+botocore — `AmazonSageMaker` tem 72(!), `AmazonQuickSight` 34, `AWSGlue`
+31, sem "o" recurso óbvio para PRM em nenhum dos três) — ver docstring do
+módulo e [docs/melhorias-futuras.md](melhorias-futuras.md). Estender essa
+tabela é trabalho incremental esperado quando houver prioridade de negócio
+para um dos 16 restantes, não uma correção pontual.
+
+`build_event_patterns()` monta o(s) event pattern(s) do EventBridge a
+partir da tabela, agrupados por `event_source` via `$or` (evita o
+falso-positivo teórico de um pattern "achatado" misturando `eventSource` e
+`eventName` de serviços diferentes) e **divididos em múltiplos patterns**
+quando um único pattern ultrapassaria a quota padrão de 2.048 caracteres do
+EventBridge (hoje, 5 regras — ver [infra/README.md](../infra/README.md)).
+`python3 -m aws_prm_tagging.event_mapping` (do diretório pai) regrava
+`infra/event_pattern.<N>.generated.json` — a única forma de manter
+`infra/template.yaml` sincronizado com esta tabela, já que o CloudFormation
+não tem como incluir um JSON externo dentro de `EventPattern` (dois testes,
+`test_event_mapping.py` e `test_infra_event_patterns.py`, travam qualquer
+divergência).
+
+### `event_parser.py` (Etapa 3)
+
+`parse_creation_event(event)` extrai 0, 1 ou N `ExtractedResource` (arn,
+servico, regiao, tipo_recurso) de um evento `"AWS API Call via CloudTrail"`
+do EventBridge — puro, nenhuma chamada de API. Devolve lista (não um único
+valor) porque algumas APIs de criação são de lote (`ec2:RunInstances` pode
+criar várias instâncias numa única chamada).
+
+**Todo evento mapeado tem extractor dedicado** (`_REGISTRY`, 92 dos 92
+eventos — `elasticmapreduce:RunJobFlow` tinha ficado fora por descuido numa
+revisão, já corrigido; o fallback genérico (`_extract_generic`) existe como
+rede de segurança, não como caminho principal). Cada extractor é um `_DirectPath`/`_ConstructedPath` (dataclasses
+inspecionáveis, não closures) com um `path` explícito — verificado por
+`test_event_parser_botocore.py` contra o shape real da operação no
+botocore instalado (ver seção de testes abaixo). Dentro dos extractors
+dedicados, uma distinção de confiança adicional importa: serviços de
+protocolo `json`/`rest-json` (a maioria) usam a capitalização exata do
+botocore (`_direct`/`_constructed`, alta confiança — o wire format real
+geralmente bate com o shape do SDK); os poucos de protocolo `query`/`ec2`/
+`rest-xml` (`ec2`, `rds`, `elasticache`, `redshift`, `elasticbeanstalk`,
+`sns`, `s3`, `route53`, `cloudfront`, `elasticloadbalancing`) usam leitura
+tolerante a capitalização (`_direct_ci`/`_constructed_ci`) ou construção a
+partir de `requestParameters` (mais simples, menos superfície de erro) —
+ver docstring do módulo para o raciocínio completo. **8 desses extractors já
+foram confirmados contra um evento CloudTrail real capturado em sandbox**
+(2026-09-23/24 — 3 tinham bug real: RDS `CreateDBInstance`, ElastiCache
+`CreateCacheCluster` e Elastic Beanstalk `CreateApplication`, todos já
+corrigidos; os outros 5 testados confirmaram o extractor existente). Só
+`cloudfront:CreateDistribution` ficou de fora (pulado por tempo de
+propagação, não por custo) — continua com leitura tolerante a
+capitalização como mitigação, não substituto. Ver
+[docs/melhorias-futuras.md](melhorias-futuras.md) e
+[test/manual-live-etapa3/README.md](../test/manual-live-etapa3/README.md)
+para o roteiro e resultado completos.
+
+### `single_resource.py` (Etapa 3)
+
+`build_resource_from_arn(session, arn, servico, regiao, expected_tag_value,
+tipo_recurso)` lê o estado atual de tags de UM ARN já conhecido (via o
+evento) e monta o dict exatamente no formato de
+`resource_discovery._build_resource` — para que `decision.classify_resource`
+(Etapa 2a) possa ser chamado sem nenhuma adaptação. Roteia por
+`(servico, tipo_recurso)` entre os 4 caminhos de leitura já usados em
+`resource_discovery.py`/`tag_execution.py` (genérico via
+`tag:GetResources`, EKS/Bedrock via `ListTagsForResource`, ELB via
+`DescribeTags`).
+
+Duplica, de propósito, a mesma chamada de API que
+`tag_execution._revalidate_generic`/`_revalidate_eks_or_bedrock`/
+`_revalidate_elb` já fazem (para um ARN de cada vez em vez de um lote) —
+não extraído um helper compartilhado agora para não mexer em código já
+testado/usado em `--live` só por esta reorganização (registrado em
+[docs/melhorias-futuras.md](melhorias-futuras.md)).
+
+### `publish.py`
+
+Publicação de um resultado no tópico SNS central — o modelo de "reporte por
+push" já descrito em
+[arquitetura-multicliente.md](arquitetura-multicliente.md), mas **sem
+nenhuma implementação no repositório antes deste módulo** (`report.py` só
+grava JSON local; `tag_execution.py` só devolve um dict). Construído como
+núcleo compartilhado (não acoplado à Etapa 3) de propósito: a Etapa 4 vai
+publicar no mesmo formato depois, no mesmo tópico.
+
+`build_outcome_payload` usa a mesma taxonomia de campos que
+`tag_execution.build_execution_report` já usa por recurso
+(`categoria_final`/`origem`/`estrategia_api`/`resultado`/`detalhe_erro`/
+`motivo`), mais os campos próprios do evento de origem (`etapa`, `event_id`,
+`event_name`, `event_source`).
+
+### `handler_continuous_tagging.py` (Etapa 3)
+
+Entrypoint Lambda da Etapa 3 — o equivalente de `main.py` para esta etapa
+(só orquestração de I/O: variáveis de ambiente, sessão boto3, publicação;
+nenhuma lógica de negócio própria). Invocado pelo Step Functions (depois do
+debounce contra corrida com IaC — ver `infra/statemachine/`), não
+diretamente pela regra do EventBridge.
+
+Fluxo por recurso extraído do evento: `single_resource.build_resource_from_arn`
+(lê o estado atual) -> `decision.classify_resource` (Etapa 2a, chamada
+direta) -> `tag_execution.run_tagging_execution(..., dry_run=False)` (Etapa
+2c, chamada direta — funciona igual para `taguear` e para qualquer outra
+decisão, sem nenhum `if` especial: `build_execution_report` já mescla os
+dois casos) -> `publish.publish_outcome`. Uma falha inesperada num recurso
+não impede o processamento dos demais recursos do mesmo evento (ex.: um
+`RunInstances` em lote) — acumulada e relançada só ao final, para marcar a
+execução do Step Functions como falha sem abortar o loop no meio.
+
+`session`/`sns_client` são injetáveis via keyword-only (default: construídos
+de verdade) — só para permitir testar o handler de ponta a ponta com
+`fake_session_factory`, sem mudar a assinatura `(event, context)` que a
+Lambda de fato invoca.
+
 ### `main.py`
 
 Único módulo com efeito de I/O de CLI (leitura de argumentos de linha de
 comando e leitura/escrita de arquivo JSON). Toda a lógica de negócio vive
-nos módulos acima, então os próximos estágios podem importar
+nos módulos acima, então as próximas Etapas podem importar
 `resource_discovery`, `tag_status`, `iac_detection`, `decision`,
 `tag_execution` etc. diretamente em um handler Lambda sem depender do CLI.
 
-Três subcomandos (`argparse` com `add_subparsers`), um por estágio
+Três subcomandos (`argparse` com `add_subparsers`), um por Etapa
 implementado — encadeados manualmente por quem roda o CLI (a saída em
 arquivo de um é a entrada em arquivo do próximo), não por um orquestrador
 único:
 
-- `map` — Etapa 1. Comportamento idêntico ao script original de estágio
-  único (mesmos argumentos `--expected-tag-value`/`--profile`/`--output`).
+- `map` — Etapa 1. Comportamento idêntico ao script original de Etapa
+  única (mesmos argumentos `--expected-tag-value`/`--profile`/`--output`).
   Falhas de descoberta por região/etapa são coletadas e passadas para
   `report.build_report(..., falhas_descoberta=...)` — nunca só logadas.
 - `decide` — Etapa 2a. Lê `--input` (saída de `map`), escreve o relatório de

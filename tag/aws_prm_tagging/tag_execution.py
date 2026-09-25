@@ -237,6 +237,7 @@ from .decision import (
 )
 from .iac_detection import IAC_CLOUDFORMATION, IAC_DESCONHECIDO, IAC_TERRAFORM_HEURISTICO, detect_iac
 from .retry import with_backoff
+from .tag_reads import bedrock_list_tags, eks_list_tags, elb_describe_tags
 from .tag_status import TAG_KEY, find_similar_tag_keys, tags_list_to_dict
 
 logger = logging.getLogger(__name__)
@@ -447,89 +448,72 @@ def _chunk(items: list, size: int) -> list[list]:
 # ---------------------------------------------------------------------------
 
 
+_TAMANHO_MAX_LOTE_GETRESOURCES = 20  # limite documentado de ResourceARNList, mesmo de TagResources
+
+
 @with_backoff()
-def _get_resources_page(client, pagination_token: str | None) -> dict:
-    kwargs: dict = {"ResourcesPerPage": 100}
-    if pagination_token:
-        kwargs["PaginationToken"] = pagination_token
-    return client.get_resources(**kwargs)
+def _get_resources_batch(client, arns: list[str]) -> dict:
+    return client.get_resources(ResourceARNList=arns)
 
 
 def _revalidate_generic(
     session: boto3.Session, regiao: str, arns: set[str], tag_key: str
 ) -> dict[str, _RevalidatedState | _RevalidationFailure]:
-    """Varredura via `tag:GetResources` cobre todos os ARNs genéricos
-    revalidados nesta região de uma vez. Deliberadamente SEM `TagFilters`
-    (ao contrário de uma versão anterior deste módulo): revalidar exige o
-    conjunto COMPLETO de tags de cada recurso, não só a `aws-apn-id` — é o
-    que permite reconfirmar o status de IaC no momento da escrita, não só
-    o valor da tag-alvo (ver docstring do módulo). Para de paginar assim
-    que todos os ARNs pedidos já foram encontrados, para não pagar o custo
-    de uma varredura completa da região quando o alvo aparece cedo.
+    """Lê o estado atual dos ARNs genéricos revalidados nesta região, em
+    lotes de até 20 (`ResourceARNList`, mesmo limite de `TagResources`) —
+    NUNCA varre a região inteira sem filtro (uma versão anterior deste
+    módulo paginava `GetResources` sem `ResourceARNList`, parando cedo só
+    se o alvo aparecesse nas primeiras páginas; para poucos ARNs — o caso
+    comum da Etapa 3, que revalida 1-poucos recursos por invocação — isso
+    podia escanear TODOS os recursos tagueados da região à toa, com risco
+    real de estourar o timeout da Lambda numa conta de cliente grande).
+    `ResourceARNList` filtra QUAIS recursos vêm na resposta, mas cada um
+    ainda vem com o conjunto COMPLETO de tags — continua sem `TagFilters`
+    (esse sim perderia campos, já que filtra por CHAVE de tag, não por
+    ARN) pelo mesmo motivo de sempre: revalidar exige todas as tags de cada
+    recurso, não só a `aws-apn-id`, pra reconfirmar o status de IaC no
+    momento da escrita (ver docstring do módulo).
 
-    Se a leitura falhar no meio da paginação, os ARNs já encontrados em
-    páginas anteriores mantêm seu estado normal (são conhecidos de
-    verdade) — só os ARNs ainda `pendentes` no momento da falha viram
-    `_RevalidationFailure`, nunca `_RevalidatedState`."""
+    Se um lote falhar, só os ARNs DESSE lote viram `_RevalidationFailure`
+    — lotes que já tinham sido lidos com sucesso mantêm seu estado normal
+    (são conhecidos de verdade)."""
     client = session.client("resourcegroupstaggingapi", region_name=regiao)
-    encontrados: dict[str, _RevalidatedState] = {}
-    pendentes = set(arns)
-    token = None
-    erro_leitura: dict | None = None
-    try:
-        while pendentes:
-            resp = _get_resources_page(client, token)
-            for mapping in resp.get("ResourceTagMappingList", []):
-                arn = mapping["ResourceARN"]
-                if arn not in pendentes:
-                    continue
-                tags = tags_list_to_dict(mapping.get("Tags", []))
-                encontrados[arn] = _RevalidatedState(
-                    valor_atual=tags.get(tag_key),
-                    iac_tipo=detect_iac(tags)["tipo"],
-                    tag_similar_encontrada=bool(find_similar_tag_keys(tags)),
-                )
-                pendentes.discard(arn)
-            token = resp.get("PaginationToken")
-            if not token:
-                break
-    except ClientError as exc:
-        erro = exc.response.get("Error", {})
-        erro_leitura = {"codigo": erro.get("Code", ""), "mensagem": erro.get("Message", "")}
-        logger.exception(
-            "Falha ao revalidar tags genéricas em %s — os %d ARN(s) ainda não "
-            "encontrados até aqui ficam marcados como revalidação falha (não "
-            "prosseguem para tentativa de escrita)",
-            regiao,
-            len(pendentes),
-        )
-
-    resultado: dict[str, _RevalidatedState | _RevalidationFailure] = dict(encontrados)
-    for arn in arns:
-        if arn in resultado:
-            continue
-        if erro_leitura is not None:
-            resultado[arn] = _RevalidationFailure(detalhe_erro=erro_leitura)
-        else:
-            resultado[arn] = _RevalidatedState(
-                valor_atual=None, iac_tipo=IAC_DESCONHECIDO, tag_similar_encontrada=False
+    resultado: dict[str, _RevalidatedState | _RevalidationFailure] = {}
+    for lote in _chunk(sorted(arns), _TAMANHO_MAX_LOTE_GETRESOURCES):
+        try:
+            resp = _get_resources_batch(client, lote)
+        except ClientError as exc:
+            erro = exc.response.get("Error", {})
+            detalhe_erro = {"codigo": erro.get("Code", ""), "mensagem": erro.get("Message", "")}
+            logger.exception(
+                "Falha ao revalidar tags genéricas em %s (lote de %d ARN(s)) — marcados "
+                "como revalidação falha (não prosseguem para tentativa de escrita)",
+                regiao,
+                len(lote),
             )
+            for arn in lote:
+                resultado[arn] = _RevalidationFailure(detalhe_erro=detalhe_erro)
+            continue
+
+        encontrados = set()
+        for mapping in resp.get("ResourceTagMappingList", []):
+            arn = mapping["ResourceARN"]
+            tags = tags_list_to_dict(mapping.get("Tags", []))
+            resultado[arn] = _RevalidatedState(
+                valor_atual=tags.get(tag_key),
+                iac_tipo=detect_iac(tags)["tipo"],
+                tag_similar_encontrada=bool(find_similar_tag_keys(tags)),
+            )
+            encontrados.add(arn)
+        for arn in lote:
+            if arn not in encontrados:
+                # GetResources não devolve recurso sem NENHUMA tag (mesma
+                # limitação documentada em single_resource.py) — tratado
+                # como "sem tag", não como falha.
+                resultado[arn] = _RevalidatedState(
+                    valor_atual=None, iac_tipo=IAC_DESCONHECIDO, tag_similar_encontrada=False
+                )
     return resultado
-
-
-@with_backoff()
-def _eks_list_tags(client, resource_arn: str) -> dict:
-    return client.list_tags_for_resource(resourceArn=resource_arn)
-
-
-@with_backoff()
-def _bedrock_list_tags(client, resource_arn: str) -> dict:
-    return client.list_tags_for_resource(resourceARN=resource_arn)
-
-
-@with_backoff()
-def _elb_describe_tags(client, arns: list[str]) -> dict:
-    return client.describe_tags(ResourceArns=arns)
 
 
 def _revalidate_eks_or_bedrock(
@@ -538,10 +522,10 @@ def _revalidate_eks_or_bedrock(
     client = session.client(service_name, region_name=regiao)
     try:
         if service_name == "eks":
-            resp = _eks_list_tags(client, resource.arn)
+            resp = eks_list_tags(client, resource.arn)
             tags = resp.get("tags", {})
         else:
-            resp = _bedrock_list_tags(client, resource.arn)
+            resp = bedrock_list_tags(client, resource.arn)
             tags = tags_list_to_dict(resp.get("tags", []))
         return _RevalidatedState(
             valor_atual=tags.get(tag_key),
@@ -577,7 +561,7 @@ def _revalidate_elb(
     }
     for lote in _chunk([r.arn for r in resources], 20):  # describe_tags aceita até 20 ARNs
         try:
-            resp = _elb_describe_tags(client, lote)
+            resp = elb_describe_tags(client, lote)
         except ClientError:
             # A chamada do lote inteiro falhou — comportamento conhecido do
             # DescribeTags de load balancers quando 1 ARN do lote não existe
@@ -596,7 +580,7 @@ def _revalidate_elb(
             )
             for arn in lote:
                 try:
-                    resp_individual = _elb_describe_tags(client, [arn])
+                    resp_individual = elb_describe_tags(client, [arn])
                 except ClientError as exc_individual:
                     erro = exc_individual.response.get("Error", {})
                     logger.exception(

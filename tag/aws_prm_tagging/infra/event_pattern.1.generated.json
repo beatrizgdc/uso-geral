@@ -1,0 +1,257 @@
+{
+  "detail-type": [
+    "AWS API Call via CloudTrail"
+  ],
+  "$or": [
+    {
+      "source": [
+        "aws.directconnect"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateConnection",
+          "CreateDirectConnectGateway"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.dms"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateReplicationInstance",
+          "CreateReplicationTask"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.ds"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateDirectory",
+          "CreateMicrosoftAD"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.dsql"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateCluster"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.dynamodb"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateTable"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.ec2"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateTransitGateway",
+          "CreateVolume",
+          "CreateVpc",
+          "RunInstances"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.ecr"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateRepository"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.ecs"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateCluster",
+          "CreateService"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.eks"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateCluster",
+          "CreateNodegroup"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.elasticache"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateCacheCluster"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.elasticbeanstalk"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateApplication",
+          "CreateEnvironment"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.elasticfilesystem"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateFileSystem"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.elasticloadbalancing"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateLoadBalancer"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.elasticmapreduce"
+      ],
+      "detail": {
+        "eventName": [
+          "RunJobFlow"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.es"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateDomain",
+          "CreateElasticsearchDomain"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.finspace"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateEnvironment"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,293 @@
+{
+  "detail-type": [
+    "AWS API Call via CloudTrail"
+  ],
+  "$or": [
+    {
+      "source": [
+        "aws.firehose"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateDeliveryStream"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.fsx"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateFileSystem"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.gamelift"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateFleet"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.glacier"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateVault"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.healthlake"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateFHIRDatastore"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.kafka"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateClusterV2"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.kendra"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateIndex"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.kinesis"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateStream"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.kinesisanalytics"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateApplication"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.kinesisvideo"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateStream"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.kms"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateKey"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.lambda"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateFunction"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.logs"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateLogGroup"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.m2"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateApplication",
+          "CreateEnvironment"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.mediaconvert"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateQueue"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.medialive"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateChannel"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.mediapackage"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateChannel"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.medical-imaging"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateDatastore"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "source": [
+        "aws.memorydb"
+      ],
+      "detail": {
+        "eventName": [
+          "CreateCluster"
+        ],
+        "errorCode": [
+          {
+            "exists": false
+          }
+        ]
+      }
+    }
+  ]
+}
