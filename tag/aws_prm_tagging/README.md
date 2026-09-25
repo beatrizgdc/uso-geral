@@ -98,6 +98,7 @@ Documentação completa:
 - [test/localstack/README.md](test/localstack/README.md) — cenário de teste local contra LocalStack, sem tocar em nenhuma conta AWS real.
 - [test/manual-live/README.md](test/manual-live/README.md) — smoke test manual da Etapa 2c (`apply --live`) contra 1 único recurso descartável, numa conta AWS real de sandbox.
 - [test/manual-live-etapa3/README.md](test/manual-live-etapa3/README.md) — roteiro de validação da Etapa 3 (captura de evento CloudTrail real, smoke test de ponta a ponta com deploy da stack, investigação de CodeBuild) numa conta AWS real de sandbox — elaborado, não executado.
+- [Output/prompt etapa 4.md](Output/prompt%20etapa%204.md) — prompt que iniciou a implementação da Etapa 4 (varredura recorrente com relatório via SNS) e a resposta da Fase 1 (análise do estado atual, lacunas, desenho proposto e perguntas em aberto) — aguardando aprovação, nenhuma implementação começou ainda.
 
 ## Onde rodar os comandos
 
